@@ -37,6 +37,8 @@ pub mod host_gpu;
 pub mod managed_runtime;
 pub mod model_readiness;
 pub mod openmpi;
+#[cfg(test)]
+mod persisted_paths_props;
 pub mod proc_lifecycle;
 pub mod report;
 pub mod report_delivery;

@@ -45,6 +45,7 @@ Each per-crate module inventory lists one file per line. Flat inventories (every
 - [`providers.rs`](../apps/rocm/src/providers.rs) — full domain extraction (no dedicated command enum; invoked from the existing chat/config command flows).
 - [`serve_cmd.rs`](../apps/rocm/src/serve_cmd.rs) — mechanical relocation, owns private types (Phase 6a): `serve()`, plus engine-recipe overrides.
 - [`serve_summary.rs`](../apps/rocm/src/serve_summary.rs) — full domain extraction.
+- [`shell_quote.rs`](../apps/rocm/src/shell_quote.rs) — shared CLI-output component (`shell_quote`), for any command line shown to an operator or handed to a shell; `rocm-dash-tui` keeps its own copy as `ui::exec::quote_display_arg` in [`exec.rs`](../crates/rocm-dash-tui/src/ui/exec.rs), since it cannot reach `apps/rocm` and the crate-edge check forbids it `rocm-core`.
 - [`storage.rs`](../apps/rocm/src/storage.rs) — full domain extraction.
 - [`therock.rs`](../apps/rocm/src/therock.rs) — full domain extraction; owns TheRock SDK install/update and the runtime-manifest model/loaders. The `runtimes` subcommand's own command enum, dispatch fn, and most of its domain logic — rendering, activation, and manifest import — stay in [`main.rs`](../apps/rocm/src/main.rs).
 - [`uninstall.rs`](../apps/rocm/src/uninstall.rs) — mechanical relocation, dispatch-adjacent, no owned types.

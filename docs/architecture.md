@@ -57,7 +57,7 @@ Modularized (ROCMAI-83, Phase 5 of EAI-7768's sequencing):
 - [`common.rs`](../apps/rocmd/src/common.rs) — helpers shared across ≥2 of the other clusters: GPU/amd-smi snapshotting, the bridge-snapshot diagnostic, `CommandCapture`/command-timeout plumbing including the shared `rocm`-subprocess capture helpers the sandbox and MCP clusters both call, and small arg/healthcheck/endpoint-key utilities. A helper earns a place here only once a second still-inline cluster calls it directly; a helper with exactly one caller stays next to that caller until its own cluster's extraction PR, even if it is conceptually similar to something that did move.
 - [`mcp.rs`](../apps/rocmd/src/mcp.rs) — the MCP stdio server, tool schema table, tool dispatch, and the `rocm`-subprocess capture/argv-building helpers behind the MCP tools.
 - [`persistence.rs`](../apps/rocmd/src/persistence.rs) — `record_event`/`load_managed_services`, the automation-event/audit-log and managed-service-registry I/O shared across the daemon's sandbox, MCP, service-lifecycle, and watcher code.
-- [`sandbox.rs`](../apps/rocmd/src/sandbox.rs) — bubblewrap/native sandbox execution, atomic-write helpers, artifact prefetch policy gating, and the sandbox-tool result shaping for `check_updates`/`driver_plan`.
+- [`sandbox.rs`](../apps/rocmd/src/sandbox.rs) — bubblewrap/native sandbox execution, artifact prefetch policy gating, and the sandbox-tool result shaping for `check_updates`/`driver_plan`.
 - [`service.rs`](../apps/rocmd/src/service.rs) — managed-service PID lifecycle/stop, `run_daemon`'s foreground loop, `supervise_service`'s spawn-and-recover path, and serve-log startup-phase polling.
 - [`watchers.rs`](../apps/rocmd/src/watchers.rs) — event collection/dispatch for all built-in watchers (TheRock update, GPU metrics/thermal-pressure, cache-warm, driver-upgrade, server-recover), plus managed-service recovery classification and automation-proposal queuing.
 - [`webhook.rs`](../apps/rocmd/src/webhook.rs) — the local webhook source: its axum routes, request validation, and watcher-kind allow-list.
@@ -68,6 +68,7 @@ Modularized (ROCMAI-83, Phase 5 of EAI-7768's sequencing):
 
 Already-extracted subsystem modules, following the same full-domain-extraction pattern (and several further siblings beyond these):
 
+- [`atomic_write.rs`](../crates/rocm-core/src/atomic_write.rs) — the one crash- and race-safe file replacement both `rocm` and `rocmd` use (unique exclusive temp file, then rename, or `ReplaceFileW` on Windows); add a caller rather than another copy.
 - [`diagnose.rs`](../crates/rocm-core/src/diagnose.rs)
 - [`examine.rs`](../crates/rocm-core/src/examine.rs)
 - [`host_gpu.rs`](../crates/rocm-core/src/host_gpu.rs) — (ROCMAI-85, Phase 7a of EAI-7768's sequencing) GPU/host hardware detection — see the module's own doc comment for what it owns.

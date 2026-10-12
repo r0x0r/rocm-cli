@@ -54,7 +54,8 @@ offered there.
 ## Prerequisites
 
 - **The `rocm` CLI.** This skill is only a driver over it; Phase 0 below installs
-  it with the user's consent if `rocm --version` fails. Nothing else here is
+  it with the user's consent if `rocm --version` fails, and stops if the installed
+  CLI is older than the catalog contract this skill requires. Nothing else here is
   assumed — the CLI does the probing.
 - **Platform:** native Linux (in-tree `amdgpu` module + `/dev/kfd`), Windows
   (HIP SDK), or WSL2 (`/dev/dxg` + the Windows host driver). NVIDIA/Intel/Apple
@@ -78,10 +79,10 @@ passes — the GPU is AMD. Linux, Windows and WSL2 all run the same workflow.
    rocm --version
    ```
 
-   If that succeeds, skip to step 1. If it's not found, install it **with the
-   user's consent** (this fetches and runs an installer that drops the `rocm` and
-   `rocmd` binaries into `~/.local/bin`). Both installers default to the
-   `release` channel, so no channel argument is needed:
+   If that succeeds, go to the contract check below. If it's not found, install
+   it **with the user's consent** (this fetches and runs an installer that drops
+   the `rocm` and `rocmd` binaries into `~/.local/bin`). Both installers default
+   to the `release` channel, so no channel argument is needed:
 
    - **Linux (x86_64 only):**
      ```
@@ -100,6 +101,28 @@ passes — the GPU is AMD. Linux, Windows and WSL2 all run the same workflow.
    After install, confirm `~/.local/bin` is on `PATH` and re-run `rocm --version`.
    If it still isn't available, hand the user the install page
    (https://github.com/ROCm/rocm-cli) and stop.
+
+   **Then check the catalog contract.** Run:
+
+   ```
+   rocm fix --json
+   ```
+
+   It prints the catalog manifest and changes nothing. Read `contract_version`
+   from the output and ignore the rest. This skill requires `contract_version` 1
+   or higher.
+
+   If the command fails, prints no `contract_version`, or prints a lower number,
+   **stop**. Say that the installed `rocm` CLI is older than this skill requires,
+   so the CLI is the side to update. Do **not** run `rocm examine`,
+   `rocm diagnose`, or `rocm fix <id>`. Offer to update the CLI by re-running the
+   installer above, with the user's consent, then repeat this check.
+
+   An older CLI rejects `--json` as an unexpected argument and exits with code 2.
+   In `reference.md`, exit code 2 is a usage error such as an unknown fix id; here
+   it means the CLI is too old. Against a CLI without this contract, the entry
+   ids, the auto-applicable set, and the exit codes this skill documents are
+   guesses, and a guess presented as a fact is the failure this check prevents.
 
 1. **Diagnose.** Pass the user's error text as the symptom:
 

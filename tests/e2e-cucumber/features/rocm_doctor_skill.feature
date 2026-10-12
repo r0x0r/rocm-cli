@@ -79,7 +79,7 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   # The skill's standing rule is "never invent a fix — if nothing matched, route
   # the user upstream". That rule is only followable if the address the CLI hands
   # over is one the skill's own routing table gives, so this is the last claim in
-  # the document that the binary can be held to.
+  # `reference.md` that the binary can be held to.
   #
   # The scenario is about the ADDRESS, not about nothing having matched. Whether
   # a report goes unexplained is not a property this suite can hold still: the
@@ -93,3 +93,16 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
     And a user who reports a failure with no catalog keyword in it
     When an agent asks the CLI to diagnose that report for tooling
     Then the CLI routes the report to a tracker the skill documents
+
+  # The one scenario that reads `SKILL.md` instead of `reference.md`. Phase 0
+  # tells an agent to stop when the installed CLI publishes a catalog contract
+  # older than the one the skill requires, and that number has to sit in the
+  # text the agent follows. A requirement ahead of the binary would make the
+  # skill refuse every current CLI, so this holds the declared number to what
+  # `rocm fix --json` really publishes. Whether an agent obeys the stop is
+  # behaviour, not text, and is checked outside this suite (the skill's
+  # behavioural evals cannot reach it: their runners carry no `rocm`).
+  @id:skill-required-contract-is-one-the-cli-publishes
+  Scenario: skill-07 - The skill never requires a catalog contract newer than the one the CLI publishes
+    When an agent asks the CLI which catalog contract it publishes
+    Then the contract the skill requires is one the CLI publishes

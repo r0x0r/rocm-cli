@@ -754,9 +754,8 @@ fn wait_for_vllm_ready(
         }
     }
 }
-/// Reads the last N lines from a log file and returns them as a formatted string.
-/// Handles large files by seeking to the last `MAX_TAIL_READ` bytes and reading
-/// forward from there.
+/// Reads the last N lines from a log file and returns them as a formatted
+/// string by delegating to [`crate::state::tail_lines`].
 fn summarize_startup_log_tail(log_path: &Path, limit: usize) -> Result<String> {
     let lines = crate::state::tail_lines(log_path, limit)?;
     if lines.is_empty() {

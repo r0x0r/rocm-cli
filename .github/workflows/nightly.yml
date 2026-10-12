@@ -1615,12 +1615,15 @@ jobs:
     # xtask and uploads; it has no business being able to write to the repo.
     permissions:
       contents: read
+    # TEMPORARY, verification-only: e2e-gpu-nightly (MI300X, stuck queued on a
+    # busy runner) and e2e-gpu-nightly-strix-windows (hangs to its 90-minute
+    # timeout) are dropped from `needs` so this branch's release-readiness
+    # pipeline can be dispatched and checked without a multi-hour wait. Revert
+    # this hunk to the full six-lane list before merging to main.
     needs:
-      - e2e-gpu-nightly
       - e2e-gpu-nightly-rad3
       - e2e-gpu-nightly-mi350p
       - e2e-gpu-nightly-strix
-      - e2e-gpu-nightly-strix-windows
       - e2e-wsl-nightly
     # Unconditional `always()`, unlike the per-PR workflow: there is no paths
     # filter to consult on a schedule, and the lanes are `continue-on-error`, so

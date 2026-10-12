@@ -377,7 +377,7 @@ const fn status_role(status: InstanceStatus) -> BoxRole {
 fn draw_empty(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let body = match &state.conn {
         ConnState::Connected { .. } => {
-            "no instances · start daemon with --enable-docker on a host with vLLM containers"
+            "no serving models discovered · open Serving to launch a managed model or check an external endpoint"
         }
         _ => "waiting for daemon…",
     };
@@ -1092,6 +1092,7 @@ mod tests {
     fn mk_state(instances: HashMap<String, Instance>, sel: usize) -> AppState {
         AppState {
             services_past_attempts: 0,
+            lemonade_managed_installed: None,
             connect: "test".into(),
             conn: ConnState::Initial,
             latest: None,

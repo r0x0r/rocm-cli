@@ -52,6 +52,7 @@ mod e2e {
 #[derive(Debug, cucumber::World)]
 pub struct E2eWorld {
     pub mock: Option<MockServer>,
+    pub lemonade_protocol: Option<e2e_cucumber::lemonade_protocol::LemonadeProtocolServer>,
     /// Loopback file server used by artifact-prefetch scenarios. Kept on the
     /// World so it remains alive while the real `rocmd` subprocess downloads.
     pub artifact_server: Option<LoopbackServer>,
@@ -263,6 +264,7 @@ impl Default for E2eWorld {
 
         Self {
             mock: None,
+            lemonade_protocol: None,
             artifact_server: None,
             paced_download_server: None,
             artifact_marker_path: None,
@@ -601,6 +603,7 @@ impl Drop for E2eWorld {
         if let Some(mock) = self.mock.take() {
             mock.stop();
         }
+        self.lemonade_protocol.take();
         self.artifact_server.take();
         self.paced_download_server.take();
         // A scenario that ran `rocm serve --managed` left a DETACHED supervisor +

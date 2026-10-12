@@ -191,6 +191,8 @@ pub struct AppState {
     /// registry read at launch (see `ResolvedArgs::services_past_attempts`).
     /// Rendered by the services overlay so failed servers are not invisible.
     pub services_past_attempts: usize,
+    /// Managed installation inventory captured at launch; not endpoint liveness.
+    pub lemonade_managed_installed: Option<bool>,
     /// Last body area used by the most recent draw. Mouse hit-tests resolve
     /// pointer coordinates against this rect (filled by `ui::draw`).
     pub last_body_area: Option<ratatui::layout::Rect>,
@@ -342,6 +344,7 @@ impl AppState {
             replay: None,
             simulated: false,
             services_past_attempts: 0,
+            lemonade_managed_installed: None,
             last_body_area: None,
             last_tab_bar_area: None,
             last_footer_chips: Vec::new(),
@@ -2162,6 +2165,7 @@ mod tests {
             tool_executor: None,
             bench_results_dir: None,
             services_past_attempts: 0,
+            lemonade_managed_installed: None,
         }
     }
 

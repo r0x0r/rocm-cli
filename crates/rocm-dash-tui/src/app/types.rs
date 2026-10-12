@@ -99,6 +99,10 @@ pub struct ResolvedArgs {
     /// a host whose servers had all failed showed an empty overlay and no sign
     /// that any record existed. 0 when there are none.
     pub services_past_attempts: usize,
+    /// Launch-time managed Lemonade installation verdict from the bin's built-in
+    /// Detect method. None means unavailable/unknown, never not installed.
+    /// Separate from live external-serving telemetry and GPU system metadata.
+    pub lemonade_managed_installed: Option<bool>,
 }
 
 impl ResolvedArgs {

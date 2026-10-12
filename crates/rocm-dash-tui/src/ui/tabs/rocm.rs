@@ -57,6 +57,7 @@ pub const VERBS: &[Verb] = &[
             "Run `rocm doctor` (one job, no approval)",
             "Review runtime / driver / permission checks",
             "Re-run after fixes with r",
+            "Press p to prepare a Doctor report: shown first, sent only on approval",
         ],
         cmd: "rocm doctor",
         read_only: true,

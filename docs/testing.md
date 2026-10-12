@@ -1414,3 +1414,29 @@ afterwards. `engine`/`engine_version` carry the same distinction: a host a
 probe found no engine on reports `"engine": "none"`, while a host whose engine
 probe never ran (skipped rather than completed) reports `"engine": "unknown"`,
 since a probe that never ran cannot say an engine is absent.
+
+### The same report from the dashboard
+
+The dashboard offers this report on its Diagnose screen (the ROCm tab's
+Diagnose verb, or `rocm` then Diagnose & fix). It calls the CLI and shows what
+the CLI prints, so there is nothing to compare by hand except the flow.
+
+1. Press `p`. The console runs `rocm diagnose --report --json` and shows the
+   report, or the refusal envelope. Nothing is sent at this step.
+2. Press `Enter` or `Esc` to leave the console. The card says "A report is
+   ready" for a report, or the CLI's own explanation for a refusal. A refusal
+   offers no way to send, and neither does output that could not be read.
+3. Press `s`. An approval shows the report again, with the default button on
+   Deny. `n`, `Esc`, `q`, or `Enter` on Deny starts nothing.
+4. Press `y`, or move to Approve and press `Enter`. The console runs
+   `rocm diagnose --report --send` and shows the CLI's own outcome: a mail
+   client opened, or the address and link printed. The same environment rules
+   as above decide which, so `ROCM_NO_BROWSER=1 rocm dash` forces the printed
+   form on a desktop.
+
+The send examines the machine again. If the machine changed between the preview
+and the approve, the mail carries the second result. The send console prints the
+report again, and the mail client shows the full content before the mail is sent.
+On a WSL host the preview always shows the `platform-not-probed` refusal, so the
+approve path needs a host with an approved architecture. The unit tests in
+`crates/rocm-dash-tui/src/ui/examine_manager.rs` cover that path everywhere.

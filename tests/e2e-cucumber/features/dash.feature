@@ -328,3 +328,29 @@ Feature: Interactive dashboard
     Then the dashboard reports live GPU telemetry
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # The Diagnose screen offers the same Doctor report the CLI prepares, and the
+  # review comes first. Whether a report can be prepared is a property of the
+  # machine, not of the dashboard: hardware that is not on AMD's published list,
+  # an architecture that cannot be read, and a WSL host all get a refusal, and
+  # only an approved architecture gets a report. So this scenario holds on any
+  # host by asserting the rule that ties the two together - the dashboard offers
+  # to send exactly when a report was prepared - rather than pinning which
+  # outcome this machine produces.
+  #
+  # The scenario never approves a send, so no mail client is ever opened from a
+  # test. The approve and decline paths, and the promise that no send starts
+  # before an approve, are asserted where the key sequence can be driven
+  # directly: the unit tests in `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
+  @id:dash-doctor-report-is-reviewed-before-sending @requires-os:linux
+  Scenario: dash-25 - A user reviews a Doctor report in the dashboard before anything is sent
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the Diagnose screen
+    And the user prepares a Doctor report
+    Then the report is displayed for review
+    When the user leaves the report review
+    Then the dashboard offers to send only a report that was prepared
+    When the user closes the Diagnose screen
+    And the user quits the dashboard
+    Then the dashboard exits successfully

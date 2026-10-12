@@ -12,18 +12,16 @@
 //! - `GET /api/v1/health` → `status` + `all_models_loaded`. Legacy servers
 //!   report only `model_loaded` (most recent access, including load/inference).
 //!
-//! The parsers (`parse_stats`, `parse_health_model`) are **pure** (serde only)
+//! The parsers (`parse_stats`, `parse_health`) are **pure** (serde only)
 //! and the deterministic, fixture-tested anchor. The async scrape
-//! ([`LemonadeCollector`]) fetches those bodies over HTTP and degrades to
-//! "not reachable" (never panics) so a host with no Lemonade endpoint is a no-op.
+//! ([`LemonadeCollector`]) fetches those bodies over HTTP and returns transport
+//! errors to the runner, which supplies endpoint context in snapshot warnings.
+//! Discovery of a never-seen absent external endpoint remains a quiet no-op.
 
 use std::time::Duration;
 
 use reqwest::Client;
-use rocm_dash_core::metrics::Instance;
-use rocm_dash_core::traits::{
-    CollectorError, DiscoveredService, InstanceSample, Result, merge_instance,
-};
+use rocm_dash_core::traits::{CollectorError, DiscoveredService, InstanceSample, Result};
 use serde::Deserialize;
 
 /// Lemonade's default OpenAI-compatible port. Mirrors `rocm_dash_tui::skills`
@@ -114,11 +112,7 @@ impl LemonadeHealth {
         {
             return loaded.into_iter().find(|name| name == last);
         }
-        if loaded.len() == 1 {
-            loaded.into_iter().next()
-        } else {
-            None
-        }
+        loaded.into_iter().next()
     }
 }
 
@@ -163,11 +157,6 @@ pub fn parse_health(body: &str) -> LemonadeHealth {
         return LemonadeHealth::default();
     }
     serde_json::from_value(value).unwrap_or_default()
-}
-
-/// PURE: first loaded model from a valid healthy response, for legacy callers.
-pub fn parse_health_model(body: &str) -> Option<String> {
-    parse_health(body).loaded_models().into_iter().next()
 }
 
 /// Deserialize a JSON **object** body into `T`, returning `T::default()` for any
@@ -225,18 +214,8 @@ pub fn lemonade_service(host: &str, port: u16, model_name: &str) -> DiscoveredSe
     }
 }
 
-/// PURE: build a finished `Instance` from a Lemonade `/health` model name + a `/stats` body.
-///
-/// This is the fixture→Instance anchor (no network). `gen_tps` flows from
-/// `tokens_per_second`; KV/req fields stay `None` (Lemonade does not report them).
-pub fn lemonade_instance(host: &str, port: u16, model_name: &str, stats_body: &str) -> Instance {
-    let svc = lemonade_service(host, port, model_name);
-    let sample = parse_stats(stats_body);
-    merge_instance(&svc, &sample, 0, 0)
-}
-
 /// Async scrape of a local Lemonade endpoint. Network/parse failure degrades to
-/// `Err`/`None` ("not reachable") — never a panic. The pure parsers above do the
+/// transport errors or an empty loaded set, never a panic. The pure parsers above do the
 /// actual mapping; this only does I/O.
 #[derive(Debug, Clone)]
 pub struct LemonadeCollector {
@@ -309,16 +288,6 @@ impl LemonadeCollector {
         Ok(parse_health(&self.get_text(LEMONADE_HEALTH_PATH).await?))
     }
 
-    /// First loaded model for compatibility callers.
-    pub async fn fetch_health_model(&self) -> Result<Option<String>> {
-        Ok(self
-            .fetch_health()
-            .await?
-            .loaded_models()
-            .into_iter()
-            .next())
-    }
-
     /// Discover every healthy loaded model; empty/unhealthy/unreachable → no rows.
     pub async fn discover_models(&self) -> Vec<DiscoveredService> {
         self.fetch_health()
@@ -328,11 +297,6 @@ impl LemonadeCollector {
             .iter()
             .map(|model| lemonade_service(&self.host, self.port, model))
             .collect()
-    }
-
-    /// First loaded row for compatibility callers. The runner uses all rows.
-    pub async fn discover(&self) -> Option<DiscoveredService> {
-        self.discover_models().await.into_iter().next()
     }
 }
 
@@ -449,9 +413,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_health_model_extracts_loaded_model() {
+    fn parse_health_extracts_loaded_model() {
         assert_eq!(
-            parse_health_model(HEALTH_FIXTURE).as_deref(),
+            parse_health(HEALTH_FIXTURE).stats_model().as_deref(),
             Some("Llama-3.2-1B-Instruct-Hybrid")
         );
     }
@@ -470,16 +434,21 @@ mod tests {
             assert_eq!(sample.gen_tps, None, "body {body:?}");
             assert!(sample.kv_cache_usage_pct.is_none());
         }
-        assert_eq!(parse_health_model("not json"), None);
-        assert_eq!(parse_health_model(r#"{"model_loaded": ""}"#), None);
+        assert!(parse_health("not json").loaded_models().is_empty());
+        assert!(
+            parse_health(r#"{"model_loaded": ""}"#)
+                .loaded_models()
+                .is_empty()
+        );
     }
 
     #[test]
     fn fixture_stats_plus_health_becomes_an_instance() {
         // The fixture→Instance anchor: no network. Health gives the model name,
         // /stats gives the live rate → an Instances-tab row.
-        let model = parse_health_model(HEALTH_FIXTURE).expect("model");
-        let inst = lemonade_instance("127.0.0.1", LEMONADE_PORT, &model, STATS_FIXTURE);
+        let model = parse_health(HEALTH_FIXTURE).stats_model().expect("model");
+        let svc = lemonade_service("127.0.0.1", LEMONADE_PORT, &model);
+        let inst = rocm_dash_core::traits::merge_instance(&svc, &parse_stats(STATS_FIXTURE), 0, 0);
         assert_eq!(inst.model_name, "Llama-3.2-1B-Instruct-Hybrid");
         assert_eq!(inst.container_name, "lemonade");
         assert_eq!(
@@ -519,7 +488,7 @@ mod tests {
                 .mount(&server)
                 .await;
             assert!(
-                collector.discover().await.is_none(),
+                collector.discover_models().await.is_empty(),
                 "health {body:?} must not advertise a serving model"
             );
         }
@@ -540,7 +509,7 @@ mod tests {
             .await;
         let collector =
             LemonadeCollector::new("127.0.0.1", server.address().port(), Duration::from_secs(1));
-        assert_eq!(collector.discover().await.unwrap().model_name, "Model-A");
+        assert_eq!(collector.discover_models().await[0].model_name, "Model-A");
     }
 
     #[tokio::test]
@@ -559,15 +528,18 @@ mod tests {
             .await;
         let collector =
             LemonadeCollector::new("127.0.0.1", server.address().port(), Duration::from_secs(1));
-        assert_eq!(collector.discover().await.unwrap().model_name, "Model-A");
+        assert_eq!(collector.discover_models().await[0].model_name, "Model-A");
     }
 
     #[tokio::test]
     async fn discover_is_clean_noop_when_endpoint_absent() {
-        // Probe a port with no server → connection refused → None, no panic.
-        // (Port 0 is never a live listener; the GET fails fast.)
-        let collector = LemonadeCollector::new("127.0.0.1", 1, Duration::from_millis(200));
-        assert!(collector.discover().await.is_none());
+        // Reserve then release a random port: an absent listener yields an empty
+        // discovery result and a stats transport error, never a panic.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let collector = LemonadeCollector::new("127.0.0.1", port, Duration::from_millis(200));
+        assert!(collector.discover_models().await.is_empty());
         assert!(collector.fetch_stats().await.is_err());
     }
 
@@ -578,7 +550,8 @@ mod tests {
     async fn live_lemonade_scrape_produces_instance() {
         let collector =
             LemonadeCollector::new("127.0.0.1", LEMONADE_PORT, Duration::from_millis(1500));
-        let svc = collector.discover().await.expect("lemonade reachable");
+        let svcs = collector.discover_models().await;
+        let svc = svcs.first().expect("lemonade reachable");
         assert_eq!(svc.port, Some(LEMONADE_PORT));
         // A stats scrape returns a sample (gen_tps may be None until an inference).
         let _sample = collector.fetch_stats().await.expect("stats scrape");

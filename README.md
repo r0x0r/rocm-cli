@@ -198,7 +198,8 @@ separately running local Lemonade server at `127.0.0.1:13305`. Configure
 `config.json` for another endpoint, or set `dashboard.daemon.enable_lemonade`
 to `false` to disable external discovery. A healthy server with no loaded models
 does not count as a running model. Discovery does not register an external server
-as a managed service or give ROCm CLI ownership of its process.
+as a managed service or give ROCm CLI ownership of its process. External models
+are visible in Observe, but are excluded from the Services stop/restart controls.
 
 The engine pane distinguishes a ROCm CLI-managed Lemonade installation from an
 externally running server. When installation detection is unavailable, it shows
@@ -609,10 +610,13 @@ with an explicit quantization variant, for example,
 safetensors-only id has no GGUF build, so serving it through Lemonade fails
 rather than silently substituting a different model. Lemonade also accepts
 registered GGUF names such as `Qwen3-0.6B-GGUF`, or the `qwen-smoke` alias.
-Direct serving resolves their checkpoint and quantization from the installed
-Lemonade catalog and uses the selected GPU backend, including Vulkan when that
-is the supported backend. It does not substitute the default model or select a
-stale ROCm backend merely because its binary is still on disk.
+On Linux, direct serving resolves simple single-GGUF entries from the installed
+Lemonade catalog. Entries needing additional files or model-specific options,
+unrecognized catalog shapes, and registered names on Windows use Lemonade's
+router instead. Explicit `owner/repo:variant` references require the selected GPU
+llama-server backend. Direct serving uses that backend, including Vulkan when
+supported; it does not select a stale ROCm binary merely because it is on disk.
+Neither route silently substitutes the default model.
 
 Some models (such as Llama) are gated and require HuggingFace authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment

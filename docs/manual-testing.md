@@ -226,6 +226,24 @@ rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0 --engine lemonade --port 11435
 For each run, confirm that the endpoint answers inference for the requested
 model and that `rocm dash` shows the managed model. A startup announcement alone
 is not proof of a working endpoint. Stop only the services created by this check.
+Simple single-GGUF catalog entries can use direct serving on Linux; registered
+entries needing extra files or model-specific options stay with the router.
+Explicit checkpoints require the selected GPU backend and must not fall back to
+another backend or CPU when it is missing.
+
+For the complex registered-model check, stop your previous test service and run:
+
+```bash
+rocm serve Qwen3.5-0.8B-GGUF --engine lemonade --managed --port 11435
+```
+
+This catalog entry needs both its GGUF checkpoint and projector file. Confirm
+that inference identifies the requested model and the engine state records
+`load_response.method` as `lemonade-cli`, not a packaged direct-server launch.
+Stop that service with `rocm services stop <service-id> --yes` and confirm its
+endpoint closes. The automated equivalent is the nightly GPU scenario
+`serve-lemonade-complex-registered-inference` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
 
 For external discovery, use a separately running Lemonade server with a loaded
 model. The embedded dashboard daemon probes `127.0.0.1:13305` by default. For a
@@ -254,8 +272,11 @@ Confirm the following through the dashboard and the external server:
   even when GPU telemetry is unavailable.
 - Unloading a model removes it from the running-model list; reloading restores it.
   A healthy but unloaded server does not claim a running model.
-- Closing the dashboard leaves the external server reachable. Do not use managed
-  stop or restart actions to control a server the CLI did not start.
+- In Observe, open Services with `s`. External models are not managed-service
+  targets. With only external models, the list reports no managed services;
+  pressing `s` or `r` stages no approval and starts no job. Close the list with
+  Escape and confirm the external endpoint is still reachable.
+- Closing the dashboard also leaves the external server reachable.
 - Setting `enable_lemonade` to `false` disables external discovery on the next
   embedded-daemon launch; managed service records remain visible.
 

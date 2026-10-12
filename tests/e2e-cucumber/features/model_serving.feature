@@ -69,14 +69,11 @@ Feature: Model serving
     Then the response contains a model reply
     And the response identifies the correct model
 
-  # HF-checkpoint direct-serve canary (EAI-8026). An `owner/repo:variant` ref
-  # bypasses Lemonade's model router and runs a packaged llama-server directly
-  # (`serve_hf_checkpoint`), which bails explicitly if no backend binary is found
-  # under bin/llamacpp/<backend>/ — unlike the short-recipe-name path above, whose
-  # managed-lemonade fallback would mask the identical failure behind the
-  # unrelated EAI-7423 xfail. Reuses the same small Qwen3-0.6B-GGUF checkpoint as
-  # `serve-lemonade-inference` (cache-shared, no extra download) so this stays a
-  # fast per-PR canary rather than needing the @nightly large-checkpoint path.
+  # Explicit HF-checkpoint canary: `owner/repo:variant` runs the selected GPU
+  # llama-server directly and fails if that backend binary is missing. Named
+  # catalog entries can also serve directly on Linux when their metadata is
+  # simple enough; other registered entries use Lemonade's router. Both canaries
+  # use the same small checkpoint, sharing the cache without another download.
   @id:serve-hf-checkpoint-inference @requires-gpu @requires-engine:lemonade
   Scenario: serve-08 - A canonical Hugging Face checkpoint serves and responds to inference
     Given a managed runtime is active
@@ -321,3 +318,18 @@ Feature: Model serving
     When the user serves that same model again with --require-api-key
     Then the CLI refuses and names the exact command to stop the existing service
     And running that command actually stops the service
+
+  # The pinned Lemonade catalog's smallest vision GGUF needs its mmproj file.
+  # Serving its registered name must retain the router, not flatten the entry
+  # into a single-checkpoint direct serve. Use a scenario-owned port and service;
+  # the additional model download stays off the ordinary per-PR path.
+  @id:serve-lemonade-complex-registered-inference @requires-gpu @requires-engine:lemonade @nightly
+  Scenario: serve-25 - A registered vision GGUF retains the Lemonade router and managed lifecycle
+    Given a managed runtime is active
+    And a registered vision GGUF is being served on lemonade on its own port
+    Then the managed engine state confirms the Lemonade router loaded the registered model
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+    When the user stops the scenario's managed Lemonade service
+    Then the managed service is stopped and its endpoint is closed

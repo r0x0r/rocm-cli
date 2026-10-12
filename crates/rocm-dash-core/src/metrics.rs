@@ -178,6 +178,10 @@ pub struct ObservationMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Instance {
+    /// Lifecycle ownership proven by discovery from a managed-service record.
+    /// Missing ownership in legacy snapshots is not permission to mutate.
+    #[serde(default)]
+    pub managed: bool,
     pub container_id: String,
     pub container_name: String,
     pub status: InstanceStatus,
@@ -219,6 +223,15 @@ pub struct Instance {
     pub log_file: Option<String>,
 }
 
+impl Instance {
+    /// External Lemonade discovery uses the engine marker, not the instance id.
+    /// This identifies provenance independently of the current serving status.
+    #[must_use]
+    pub fn is_external_lemonade(&self) -> bool {
+        !self.managed && self.container_name == "lemonade"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,11 +249,50 @@ mod tests {
             "log_file": null
         }"#;
         let inst: Instance = serde_json::from_str(legacy).expect("legacy instance must parse");
+        assert!(
+            !inst.managed,
+            "legacy snapshots do not grant lifecycle control"
+        );
         assert_eq!(inst.gen_tps, None);
         assert_eq!(inst.tokens_per_watt, None);
         assert_eq!(inst.ttft_ms, None);
         assert_eq!(inst.tpot_ms, None);
         assert_eq!(inst.kv_cache_usage_pct, Some(42.0));
+    }
+
+    #[test]
+    fn instance_ownership_round_trips_and_defaults_to_false() {
+        assert!(!Instance::default().managed);
+        for managed in [false, true] {
+            let inst = Instance {
+                managed,
+                ..Instance::default()
+            };
+            let json = serde_json::to_value(&inst).expect("serialize");
+            assert_eq!(json["managed"], managed);
+            let back: Instance = serde_json::from_value(json).expect("deserialize");
+            assert_eq!(back.managed, managed);
+        }
+    }
+
+    #[test]
+    fn external_lemonade_predicate_ignores_ids_and_requires_engine_marker() {
+        for id in ["svc-looks-managed", "lemonade-looks-external"] {
+            for managed in [false, true] {
+                for marker in ["lemonade", "vllm", ""] {
+                    let inst = Instance {
+                        managed,
+                        container_id: id.into(),
+                        container_name: marker.into(),
+                        ..Instance::default()
+                    };
+                    assert_eq!(
+                        inst.is_external_lemonade(),
+                        !managed && marker == "lemonade"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

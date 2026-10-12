@@ -133,8 +133,29 @@ The real GPU scenarios `serve-lemonade-inference` and
 start Lemonade, request inference, and verify the model identity. The named-model
 case uses `Qwen3-0.6B-GGUF`; the checkpoint case uses
 `unsloth/Qwen3-0.6B-GGUF:Q4_0`. Both require a usable AMD GPU. Unit tests cover
-registered-name catalog resolution, quantization matching, and selection of the
-runtime's GPU backend when competing backend directories exist.
+registered-name catalog resolution, conservative routing of multi-file and
+model-specific catalog entries, quantization matching, and selection of the
+runtime's GPU backend when competing backend directories exist. Engine tests also
+verify persisted router identity through the health inference request; direct
+servers retain the exact requested alias.
+
+`serve-lemonade-complex-registered-inference` covers the pinned catalog's
+`Qwen3.5-0.8B-GGUF` entry, which also needs a projector file. It verifies router
+state, real inference for that model, and stopping the scenario-owned managed
+service on its isolated port. The `@requires-gpu` and
+`@requires-engine:lemonade` tags require a usable AMD GPU on a Lemonade lane.
+Its `@nightly` tag also requires `E2E_INCLUDE_NIGHTLY=1`, or the self-hosted
+workflow's `include_nightly` dispatch input. A runtime channel named `nightly`
+does not enable these scenarios by itself.
+
+The daemon's Lemonade contracts in
+[telemetry_contract.rs](../crates/rocm-dash-daemon/tests/telemetry_contract.rs)
+hold observation time during singleton-to-multiple-model transitions. The first
+multi-model snapshot must clear both the rate and its observation metadata;
+natural expiry cannot satisfy that assertion. Independent endpoints must overlap
+while each endpoint checks health before fetching stats. Health failures include
+endpoint context, and an unavailable external endpoint removes its rows without
+a grace period. A never-seen absent endpoint remains quiet.
 
 The dashboard scenarios in
 [dash.feature](../tests/e2e-cucumber/features/dash.feature) include:
@@ -142,7 +163,9 @@ The dashboard scenarios in
 - `dash-lemonade-external-protocol-discovery`: a Lemonade protocol fixture on an
   isolated non-default port, with multiple loaded models and no managed records.
   The real CLI, embedded daemon, and TUI must discover it, report installation
-  truthfully, and leave the external endpoint alive after the dashboard closes.
+  truthfully, exclude it from Services lifecycle targets, ignore stop/restart
+  attempts without approval or jobs, and leave the endpoint alive after both the
+  attempts and dashboard quit.
 - `dash-lemonade-external-protocol-transitions`: loaded-model changes and endpoint
   unavailability must update the dashboard, rather than retain false serving
   claims.

@@ -126,6 +126,18 @@ These modules are private `mod` declarations — [`lib.rs`](../crates/e2e-report
 
 ### `engines/lemonade`, `engines/vllm` — inference engine adapters
 
+Lemonade's route decision in
+[`direct_llama.rs`](../engines/lemonade/src/direct_llama.rs) keeps unknown or
+multi-file catalog entries with the router. A direct server retains its exact
+alias; router state records the normalized served name as `canonical_model_id`
+while preserving the requested `model_ref`.
+
+Dashboard ownership comes from managed registry discovery, not endpoint names or
+ID prefixes. The serde-defaulted `Instance.managed` field in
+[`metrics.rs`](../crates/rocm-dash-core/src/metrics.rs) defaults to false for older
+snapshots. External rows remain observable but are excluded from lifecycle
+controls in [`services_manager.rs`](../crates/rocm-dash-tui/src/ui/services_manager.rs).
+
 `engines/vllm` follows full domain extraction:
 
 - [`install.rs`](../engines/vllm/src/install.rs) — ROCm/vLLM build-variant discovery, install execution, and runtime-repair assessment.

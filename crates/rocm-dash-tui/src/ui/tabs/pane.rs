@@ -391,11 +391,10 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> (Vec<Line<'
             // External endpoint evidence is live; managed installation evidence
             // is a separate launch-time Detect snapshot. GPU metadata carries
             // neither verdict and must never imply an absent engine.
-            let external_running = state.instances.values().any(|i| {
-                i.container_name == "lemonade"
-                    && i.container_id.starts_with("lemonade-")
-                    && i.status.is_serving()
-            });
+            let external_running = state
+                .instances
+                .values()
+                .any(|i| i.is_external_lemonade() && i.status.is_serving());
             let lemon = if external_running {
                 "Lemonade — externally running"
             } else {
@@ -549,6 +548,35 @@ mod tests {
         assert!(engine_text(&state).contains("Managed runtime — installed"));
         state.instances.get_mut(&id).unwrap().status = InstanceStatus::Stopped;
         assert!(engine_text(&state).contains("Lemonade — managed runtime installed"));
+        assert!(!engine_text(&state).contains("externally running"));
+    }
+
+    #[test]
+    fn external_lemonade_verdict_uses_ownership_not_id_prefix() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("unix:/unused".into(), "dark".into());
+        let id = "svc-ordinary-id".to_owned();
+        state.instances.insert(
+            id.clone(),
+            Instance {
+                managed: false,
+                container_id: id.clone(),
+                container_name: "lemonade".into(),
+                status: InstanceStatus::Ready,
+                ..Instance::default()
+            },
+        );
+        assert!(engine_text(&state).contains("Lemonade — externally running"));
+        let external = state.instances.remove(&id).unwrap();
+        assert!(!engine_text(&state).contains("externally running"));
+        state.instances.insert(
+            "lemonade-looks-external".into(),
+            Instance {
+                managed: true,
+                container_id: "lemonade-looks-external".into(),
+                ..external
+            },
+        );
         assert!(!engine_text(&state).contains("externally running"));
     }
 

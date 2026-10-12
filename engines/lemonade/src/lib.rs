@@ -15,7 +15,7 @@ use rocm_engine_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod backend_alignment;
@@ -450,11 +450,7 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
     let endpoint_url = crate::state::endpoint_url(&request.host, request.port);
     let serve_request = ServeHttpRequest {
         service_id: request.service_id.clone(),
-        model_ref: if runtime_is_linux() {
-            request.model_ref.clone()
-        } else {
-            crate::state::resolve_lemonade_model_ref(&request.model_ref)
-        },
+        model_ref: request.model_ref.clone(),
         host: request.host.clone(),
         port: request.port,
         device_policy: request
@@ -510,48 +506,30 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     process_env.gpu_indices = request.gpu_indices.clone();
     let log_path = request.log_path.as_deref();
     crate::state::write_running_state(&request, &runtime, std::process::id(), None, "starting")?;
-    let paths = AppPaths::discover()?;
-    let direct_model = if runtime_is_linux()
-        || crate::direct_llama::parse_hf_checkpoint(&request.model_ref).is_some()
-    {
-        crate::direct_llama::resolve_direct_llama_model(&runtime.manifest, &request.model_ref)?
-    } else {
-        None
+    let route =
+        crate::direct_llama::serving_route(&runtime.manifest, &request, runtime_is_linux())?;
+    let router_model_ref = match route {
+        crate::direct_llama::ServeRoute::Direct { model, server } => {
+            let model_path = crate::direct_llama::ensure_direct_llama_model_available(
+                &request,
+                &runtime,
+                &process_env,
+                log_path,
+                &model,
+            )?;
+            let backend = crate::direct_llama::llama_server_backend_label(&server);
+            return crate::process::serve_direct_llama_server(
+                &request,
+                &runtime,
+                &process_env,
+                &server,
+                &model_path,
+                log_path,
+                &anyhow!("using Lemonade packaged {backend} llama-server directly"),
+            );
+        }
+        crate::direct_llama::ServeRoute::Router { model_ref } => model_ref,
     };
-    // Only models with a validated direct GGUF resolution bypass the router.
-    // Recipe-backed/non-GGUF names must use Lemonade rather than substitute a model.
-    if (runtime_is_linux()
-        || crate::direct_llama::parse_hf_checkpoint(&request.model_ref).is_some())
-        && let Some(model) = direct_model.as_ref()
-        && let Some(server) = crate::direct_llama::direct_serve_binary(&runtime.manifest)
-    {
-        let model_path = crate::direct_llama::ensure_direct_llama_model_available(
-            &request,
-            &runtime,
-            &process_env,
-            log_path,
-            model,
-        )?;
-        let backend = crate::direct_llama::llama_server_backend_label(&server);
-        return crate::process::serve_direct_llama_server(
-            &request,
-            &runtime,
-            &process_env,
-            &server,
-            &model_path,
-            log_path,
-            &anyhow!("using Lemonade packaged {backend} llama-server directly"),
-        );
-    }
-    if crate::direct_llama::parse_hf_checkpoint(&request.model_ref).is_some() {
-        bail!(
-            "no selected GPU llama-server backend `{}` is installed under {} for direct serving of `{}`",
-            runtime.manifest.backend_name,
-            runtime.manifest.runtime_dir.display(),
-            request.model_ref
-        );
-    }
-    let router_model_ref = crate::state::resolve_lemonade_model_ref(&request.model_ref);
     let mut child = crate::process::spawn_lemond(
         &runtime.manifest,
         &request.host,
@@ -559,12 +537,13 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         log_path,
         &process_env,
     )?;
-    crate::state::write_running_state(
+    crate::state::write_running_state_for_model(
         &request,
         &runtime,
         std::process::id(),
         Some(child.id()),
         "running",
+        &router_model_ref,
     )?;
     crate::process::wait_for_lemonade_cli_status(
         &runtime.manifest,
@@ -624,21 +603,6 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         );
         let _ = crate::state::terminate_pid(child.id(), true);
         let _ = child.wait();
-        if runtime_is_linux()
-            && let Some(model) = direct_model.as_ref()
-            && let Some(model_path) = crate::direct_llama::direct_llama_model_path(&paths, model)?
-            && let Some(direct_server) = crate::direct_llama::direct_serve_binary(&runtime.manifest)
-        {
-            return crate::process::serve_direct_llama_server(
-                &request,
-                &runtime,
-                &process_env,
-                &direct_server,
-                &model_path,
-                log_path,
-                &error,
-            );
-        }
         return Err(error).with_context(|| {
             format!(
                 "failed to verify {} with Lemonade {LLAMACPP_RECIPE}:{backend}",
@@ -658,7 +622,7 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
             "load_response": {
                 "status": "loaded",
                 "method": "lemonade-cli",
-                "model_name": request.model_ref,
+                "model_name": router_model_ref,
                 "llamacpp_backend": backend
             },
         }),
@@ -682,7 +646,11 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
 fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckResponse> {
     rocm_core::require_nonempty(&request.service_id, "service_id")?;
     let files = crate::state::service_files(&request.service_id)?;
-    let state = crate::state::read_service_state(&files.state_path).ok();
+    healthcheck_service_at(&files.state_path)
+}
+
+fn healthcheck_service_at(state_path: &Path) -> Result<HealthcheckResponse> {
+    let state = crate::state::read_service_state(state_path).ok();
     let endpoint_url = state
         .as_ref()
         .and_then(crate::state::endpoint_url_from_state);
@@ -716,12 +684,7 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
     // once before reporting ready.
     let ready = listed
         && endpoint_url.as_deref().is_some_and(|endpoint| {
-            crate::state::inference_verified(
-                &files.state_path,
-                state.as_ref(),
-                endpoint,
-                &model_ref,
-            )
+            crate::state::inference_verified(state_path, state.as_ref(), endpoint, &model_ref)
         });
     let device = if ready {
         crate::state::reported_device(state.as_ref(), &backend)
@@ -819,6 +782,133 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serving_regression_persisted_identity_drives_health_chat_model() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        for (tag, served_name) in [("router", "Qwen3-0.6B-GGUF"), ("direct", "qwen-smoke")] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            let expected = served_name.to_owned();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0; 1024];
+                    let (header_end, content_len) = loop {
+                        let count = stream.read(&mut buffer).unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&buffer[..count]);
+                        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]);
+                            let len = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap_or(0);
+                            break (end + 4, len);
+                        }
+                    };
+                    while bytes.len() < header_end + content_len {
+                        let count = stream.read(&mut buffer).unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&buffer[..count]);
+                    }
+                    let chat = bytes.starts_with(b"POST ");
+                    let body = if chat {
+                        json!({"choices": [{"message": {"content": "ok"}}]})
+                    } else {
+                        json!({"all_models_loaded": [{"model_name": expected, "recipe_options": {"llamacpp_backend": "vulkan"}}]})
+                    }.to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                    if chat {
+                        let payload: Value =
+                            serde_json::from_slice(&bytes[header_end..header_end + content_len])
+                                .unwrap();
+                        return payload["model"].as_str().unwrap().to_owned();
+                    }
+                }
+                panic!("health inference request was not received");
+            });
+            let temporary = tempfile::tempdir().unwrap();
+            let dir = temporary.path();
+            let request = ServeHttpRequest {
+                service_id: tag.to_owned(),
+                model_ref: "qwen-smoke".to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port,
+                device_policy: DevicePolicy::GpuRequired,
+                gpu_indices: vec![1],
+                runtime_id: None,
+                env_id: None,
+                state_path: dir.join("state.json"),
+                log_path: None,
+                engine_recipe: None,
+            };
+            let runtime = crate::backend_alignment::LemonadeRuntime {
+                manifest: crate::install::LemonadeInstallManifest {
+                    env_id: "test".to_owned(),
+                    version: "test".to_owned(),
+                    runtime_dir: dir.join("runtime"),
+                    lemond: dir.join("lemond"),
+                    lemonade: dir.join("lemonade"),
+                    backend_recipe: LLAMACPP_RECIPE.to_owned(),
+                    backend_name: "vulkan".to_owned(),
+                    installed_at_unix_ms: 0,
+                },
+            };
+            if tag == "direct" {
+                crate::state::write_running_state(
+                    &request,
+                    &runtime,
+                    std::process::id(),
+                    None,
+                    "ready",
+                )
+                .unwrap();
+            } else {
+                crate::state::write_running_state_for_model(
+                    &request,
+                    &runtime,
+                    std::process::id(),
+                    None,
+                    "ready",
+                    served_name,
+                )
+                .unwrap();
+            }
+            crate::state::merge_json_state(
+                &request.state_path,
+                &json!({"backend_requested": "vulkan"}),
+            )
+            .unwrap();
+            let response = healthcheck_service_at(&request.state_path).unwrap();
+            let chat_model = server.join().unwrap();
+            let state = crate::state::read_service_state(&request.state_path).unwrap();
+            assert_eq!(response.status, "ready");
+            assert_eq!(state["model_ref"], "qwen-smoke");
+            assert_eq!(chat_model, served_name);
+            assert_eq!(state["canonical_model_id"], served_name);
+            assert!(state.get(rocm_core::INFERENCE_VERIFIED_STATE_KEY).is_some());
+        }
+    }
 
     #[test]
     fn stop_scope_targets_only_the_recorded_lemonade_server() {

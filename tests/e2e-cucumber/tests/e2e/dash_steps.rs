@@ -190,6 +190,7 @@ async fn external_unreachable(world: &mut E2eWorld) {
 }
 
 #[then("the external protocol fixture remains alive after dashboard quit")]
+#[then("the external protocol fixture remains alive without managed records")]
 async fn external_survives_quit(world: &mut E2eWorld) {
     let fixture = world.lemonade_protocol.as_ref().expect("fixture");
     let response = reqwest::get(format!("{}/api/v1/health", fixture.base_url()))
@@ -241,6 +242,21 @@ async fn external_installation_truth(world: &mut E2eWorld) {
         )
         .await
         .expect("engine status must distinguish external service and managed install");
+}
+
+#[then("Lemonade returns to the managed installation status without external availability")]
+async fn external_availability_cleared(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "unreachable endpoint no longer counts as external availability",
+            |screen| {
+                screen.contains("Lemonade — managed runtime not installed")
+                    && !screen.contains("Lemonade — externally running")
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("engine status must return to managed inventory after endpoint loss");
 }
 
 #[then("the real managed Lemonade model is displayed")]
@@ -422,6 +438,31 @@ async fn open_services_overlay(world: &mut E2eWorld) {
     tui.wait_for_screen(SERVICES_OVERLAY_TITLE, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("failed to open the services overlay: {e}"));
+}
+
+#[then("the Services overlay has no managed servers")]
+async fn external_services_are_read_only(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(
+            "No managed services. Start one with `rocm serve <model> --managed`.",
+            default_timeout(),
+        )
+        .await
+        .expect("discovered external models must not become lifecycle targets");
+}
+
+#[when("the user attempts to stop and restart the external models")]
+async fn external_lifecycle_keys_do_nothing(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.send("sr").expect("attempt stop and restart");
+    // One Escape closes the list only if neither key staged an approval or a
+    // lifecycle console. In either modal, it dismisses that modal instead and
+    // leaves the Services overlay open, making this assertion fail.
+    tui.send("\u{1b}").expect("close Services list");
+    tui.wait_until_gone(SERVICES_OVERLAY_TITLE, default_timeout())
+        .await
+        .expect("external lifecycle keys must not stage approval or launch a job");
+    external_models_visible(world).await;
 }
 
 #[then("the overlay reports the record that is no longer running")]

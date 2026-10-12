@@ -811,6 +811,50 @@ mod tests {
     use super::*;
     use crate::DEFAULT_MODEL;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn serving_gpu_model_load_process_error_is_returned() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path();
+        let executable = dir.join("lemonade");
+        let args_path = dir.join("args.txt");
+        fs::write(&executable, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args.txt\"\nprintf 'GPU backend initialization failed\\n' >&2\nexit 23\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = LemonadeInstallManifest {
+            env_id: "test".to_owned(),
+            version: "test".to_owned(),
+            runtime_dir: dir.join("runtime"),
+            lemond: dir.join("lemond"),
+            lemonade: executable,
+            backend_recipe: crate::LLAMACPP_RECIPE.to_owned(),
+            backend_name: "vulkan".to_owned(),
+            installed_at_unix_ms: 0,
+        };
+        let log = dir.join("load.log");
+        let error = run_lemonade_model_load(
+            &manifest,
+            "127.0.0.1",
+            11435,
+            "Qwen3-0.6B-GGUF",
+            "vulkan",
+            None,
+            Some(&log),
+            &LemonadeProcessEnvironment::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Lemonade model load failed"));
+        assert!(error.to_string().contains("23"));
+        assert!(
+            fs::read_to_string(log)
+                .unwrap()
+                .contains("GPU backend initialization failed")
+        );
+        let args = fs::read_to_string(args_path).unwrap();
+        assert!(args.contains("load\nQwen3-0.6B-GGUF\n--llamacpp\nvulkan\n"));
+        assert!(!args.contains("cpu"));
+    }
+
     #[test]
     fn models_ready_accepts_direct_serve_and_gates_router_backend() {
         // Direct-serve (stock llama-server): no `recipe_options` → ready by name.

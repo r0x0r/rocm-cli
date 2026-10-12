@@ -24,6 +24,56 @@ pub(crate) enum DirectLlamaModel {
     Checkpoint(HfCheckpoint),
 }
 
+#[derive(Debug)]
+pub(crate) enum ServeRoute {
+    Direct {
+        model: DirectLlamaModel,
+        server: PathBuf,
+    },
+    Router {
+        model_ref: String,
+    },
+}
+
+/// Choose the serving path before downloading or launching a server.
+pub(crate) fn serving_route(
+    manifest: &LemonadeInstallManifest,
+    request: &ServeHttpRequest,
+    is_linux: bool,
+) -> Result<ServeRoute> {
+    crate::state::require_gpu_required(&request.device_policy)?;
+    let explicit_checkpoint = parse_hf_checkpoint(&request.model_ref).is_some();
+    if (is_linux || explicit_checkpoint)
+        && let Some(model) = resolve_direct_llama_model(manifest, &request.model_ref)?
+        && let Some(server) = direct_serve_binary(manifest)
+    {
+        return Ok(ServeRoute::Direct { model, server });
+    }
+    if explicit_checkpoint {
+        if manifest.backend_recipe != crate::LLAMACPP_RECIPE {
+            bail!(
+                "selected Lemonade recipe `{}` does not support direct HF checkpoint serving; a GPU llama.cpp recipe is required",
+                manifest.backend_recipe
+            );
+        }
+        if !DIRECT_LLAMA_SERVER_BACKENDS.contains(&manifest.backend_name.as_str()) {
+            bail!(
+                "selected Lemonade backend `{}` does not support GPU direct serving; no CPU fallback is used",
+                manifest.backend_name
+            );
+        }
+        bail!(
+            "no selected GPU llama-server backend `{}` is installed under {} for direct serving of `{}`",
+            manifest.backend_name,
+            manifest.runtime_dir.display(),
+            request.model_ref
+        );
+    }
+    Ok(ServeRoute::Router {
+        model_ref: resolve_lemonade_model_ref(&request.model_ref),
+    })
+}
+
 pub(crate) fn resolve_direct_llama_model(
     manifest: &LemonadeInstallManifest,
     model_ref: &str,
@@ -255,19 +305,15 @@ pub(crate) fn resolve_direct_llama_checkpoint(
         return require_checkpoint_variant(checkpoint, model_ref).map(Some);
     }
     let registry_path = manifest.runtime_dir.join("resources/server_models.json");
-    let bytes = match fs::read(&registry_path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read {}", registry_path.display()));
-        }
+    let Ok(bytes) = fs::read(&registry_path) else {
+        return Ok(None);
     };
-    let registry: serde_json::Value = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid model registry {}", registry_path.display()))?;
-    let entries = registry
-        .as_object()
-        .context("Lemonade model registry must be an object")?;
+    let Ok(registry) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(None);
+    };
+    let Some(entries) = registry.as_object() else {
+        return Ok(None);
+    };
     let name = resolve_lemonade_model_ref(model_ref);
     let Some(metadata) = entries.get(&name) else {
         return Ok(None);
@@ -275,13 +321,39 @@ pub(crate) fn resolve_direct_llama_checkpoint(
     if metadata.get("recipe").and_then(serde_json::Value::as_str) != Some(crate::LLAMACPP_RECIPE) {
         return Ok(None);
     }
-    let checkpoint_ref = metadata
+    let Some(checkpoint_ref) = metadata
         .get("checkpoint")
         .and_then(serde_json::Value::as_str)
-        .with_context(|| format!("registered model `{name}` has no checkpoint"))?;
+    else {
+        return Ok(None);
+    };
+    // Keep malformed known checkpoint paths an error even when other fields would
+    // make the recipe router-only. They must not escape validation via routing.
     let checkpoint = parse_hf_checkpoint(checkpoint_ref)
         .with_context(|| format!("registered model `{name}` has an invalid HF checkpoint"))?;
-    require_checkpoint_variant(checkpoint, &name).map(Some)
+    let Some(fields) = metadata.as_object() else {
+        return Ok(None);
+    };
+    // Only the single-checkpoint shape is supported directly. Extra files,
+    // multimodal inputs, options and unknown fields belong to Lemonade's router.
+    // In the 11.5.1 source, size/suggested describe catalog entries and these
+    // labels classify chat models. Other labels can change launch flags (MTP).
+    if checkpoint.variant.is_none()
+        || fields.iter().any(|(key, value)| match key.as_str() {
+            "recipe" | "checkpoint" => false,
+            "size" => !value.as_f64().is_some_and(|size| size >= 0.0),
+            "suggested" => !value.is_boolean(),
+            "labels" => !value.as_array().is_some_and(|labels| {
+                labels.iter().all(|label| {
+                    matches!(label.as_str(), Some("reasoning" | "tool-calling" | "tools"))
+                })
+            }),
+            _ => true,
+        })
+    {
+        return Ok(None);
+    }
+    Ok(Some(checkpoint))
 }
 
 fn require_checkpoint_variant(checkpoint: HfCheckpoint, model_ref: &str) -> Result<HfCheckpoint> {
@@ -445,12 +517,13 @@ mod tests {
     /// `CARGO_MANIFEST_DIR`, a compile-time constant, so the path never derives from a
     /// runtime environment read.
     fn scratch_dir(tag: &str) -> PathBuf {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!("lemonade-fs-test-{tag}"));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        fs::create_dir_all(&base).unwrap();
+        tempfile::Builder::new()
+            .prefix(&format!("lemonade-fs-test-{tag}-"))
+            .tempdir_in(base)
+            .unwrap()
+            .keep()
     }
 
     fn write_registry(manifest: &LemonadeInstallManifest, registry: serde_json::Value) {
@@ -461,6 +534,201 @@ mod tests {
             serde_json::to_vec(&registry).unwrap(),
         )
         .unwrap();
+    }
+
+    fn serve_request(model_ref: &str) -> ServeHttpRequest {
+        ServeHttpRequest {
+            service_id: "test".to_owned(),
+            model_ref: model_ref.to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 11435,
+            device_policy: rocm_engine_protocol::DevicePolicy::GpuRequired,
+            gpu_indices: vec![1],
+            runtime_id: None,
+            env_id: None,
+            state_path: PathBuf::from("state.json"),
+            log_path: None,
+            engine_recipe: None,
+        }
+    }
+
+    #[test]
+    fn serving_route_covers_platform_recipe_binary_and_policy_boundaries() {
+        let dir = scratch_dir("serving-routes");
+        let mut manifest = test_manifest(dir.join("runtime"));
+        manifest.backend_name = "vulkan".to_owned();
+        write_registry(
+            &manifest,
+            serde_json::json!({
+                "Qwen3-0.6B-GGUF": {"recipe": "llamacpp", "checkpoint": "owner/repo:Q4_0", "suggested": true, "size": 0.38, "labels": ["reasoning"]},
+                "Complex": {"recipe": "llamacpp", "checkpoint": "owner/repo:Q4_0", "mmproj": "owner/repo:mmproj.gguf"},
+                "OtherRecipe": {"recipe": "oga", "checkpoint": "owner/repo"}
+            }),
+        );
+        let binary = manifest
+            .runtime_dir
+            .join("bin/llamacpp/vulkan")
+            .join(platform_binary_name("llama-server"));
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"x").unwrap();
+        for is_linux in [true, false] {
+            let requested = serve_request("qwen-smoke");
+            let route = serving_route(&manifest, &requested, is_linux).unwrap();
+            if is_linux {
+                assert!(matches!(route, ServeRoute::Direct { server, .. } if server == binary));
+            } else {
+                assert!(
+                    matches!(route, ServeRoute::Router { model_ref } if model_ref == "Qwen3-0.6B-GGUF")
+                );
+            }
+            assert_eq!(
+                requested.model_ref, "qwen-smoke",
+                "direct aliases are not normalized"
+            );
+            assert!(matches!(
+                serving_route(&manifest, &serve_request("owner/repo:Q4_0"), is_linux).unwrap(),
+                ServeRoute::Direct { .. }
+            ));
+            assert!(serving_route(&manifest, &serve_request("owner/repo"), is_linux).is_err());
+            for name in ["Complex", "Unknown", "OtherRecipe"] {
+                assert!(
+                    matches!(serving_route(&manifest, &serve_request(name), is_linux).unwrap(), ServeRoute::Router { model_ref } if model_ref == name)
+                );
+            }
+            let mut cpu_request = serve_request("qwen-smoke");
+            cpu_request.device_policy = rocm_engine_protocol::DevicePolicy::CpuOnly;
+            assert!(
+                serving_route(&manifest, &cpu_request, is_linux)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no CPU fallback")
+            );
+        }
+        fs::remove_file(&binary).unwrap();
+        for is_linux in [true, false] {
+            assert!(matches!(
+                serving_route(&manifest, &serve_request("qwen-smoke"), is_linux).unwrap(),
+                ServeRoute::Router { .. }
+            ));
+            assert!(
+                serving_route(&manifest, &serve_request("owner/repo:Q4_0"), is_linux)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no selected GPU llama-server")
+            );
+        }
+        // Recipe/backend refusal is independent of a missing packaged binary.
+        fs::write(&binary, b"x").unwrap();
+        let cpu_binary = manifest
+            .runtime_dir
+            .join("bin/llamacpp/cpu")
+            .join(platform_binary_name("llama-server"));
+        fs::create_dir_all(cpu_binary.parent().unwrap()).unwrap();
+        fs::write(cpu_binary, b"x").unwrap();
+        for (recipe, backend) in [
+            ("oga", "vulkan"),
+            (LLAMACPP_RECIPE, "cpu"),
+            (LLAMACPP_RECIPE, "unknown"),
+        ] {
+            manifest.backend_recipe = recipe.to_owned();
+            manifest.backend_name = backend.to_owned();
+            for is_linux in [true, false] {
+                assert!(matches!(
+                    serving_route(&manifest, &serve_request("qwen-smoke"), is_linux).unwrap(),
+                    ServeRoute::Router { .. }
+                ));
+                let error = serving_route(&manifest, &serve_request("owner/repo:Q4_0"), is_linux)
+                    .unwrap_err()
+                    .to_string();
+                let expected = if recipe == LLAMACPP_RECIPE {
+                    "does not support GPU direct serving"
+                } else {
+                    "does not support direct HF checkpoint serving"
+                };
+                assert!(error.contains(expected), "{error}");
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn serving_regression_complex_registered_models_use_router() {
+        let dir = scratch_dir("registered-complex");
+        let manifest = test_manifest(dir.join("runtime"));
+        for (key, value) in [
+            ("mmproj", serde_json::json!("owner/repo:mmproj.gguf")),
+            (
+                "checkpoints",
+                serde_json::json!(["owner/repo:Q4_0", "owner/repo:mmproj.gguf"]),
+            ),
+            ("extra_files", serde_json::json!(["tokenizer.json"])),
+            ("options", serde_json::json!({"ctx_size": 8192})),
+            ("source", serde_json::json!("alternate")),
+            ("unknown_option", serde_json::json!(true)),
+            ("recipe_options", serde_json::json!({"ctx_size": 8192})),
+            ("labels", serde_json::json!(["vision"])),
+            ("labels", serde_json::json!(["mtp"])),
+            ("labels", serde_json::json!(["unknown"])),
+            ("labels", serde_json::json!([123])),
+            ("labels", serde_json::json!("reasoning")),
+            ("size", serde_json::json!("0.38")),
+            ("suggested", serde_json::json!(1)),
+        ] {
+            let mut metadata =
+                serde_json::json!({"recipe": "llamacpp", "checkpoint": "owner/repo:Q4_0"});
+            metadata[key] = value;
+            write_registry(&manifest, serde_json::json!({"Complex-GGUF": metadata}));
+            assert!(
+                resolve_direct_llama_model(&manifest, "Complex-GGUF")
+                    .unwrap()
+                    .is_none(),
+                "{key}"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn serving_regression_safe_variantless_registered_model_uses_router() {
+        let dir = scratch_dir("registered-variantless");
+        let manifest = test_manifest(dir.join("runtime"));
+        write_registry(
+            &manifest,
+            serde_json::json!({
+                "Variantless": {"recipe": "llamacpp", "checkpoint": "owner/repo"}
+            }),
+        );
+        assert!(
+            resolve_direct_llama_model(&manifest, "Variantless")
+                .unwrap()
+                .is_none()
+        );
+        assert!(resolve_direct_llama_model(&manifest, "owner/repo").is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn serving_regression_unusable_catalog_uses_router() {
+        let dir = scratch_dir("registered-unusable");
+        let manifest = test_manifest(dir.join("runtime"));
+        let catalog = manifest.runtime_dir.join("resources/server_models.json");
+        fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+        for bytes in [b"[]".as_slice(), b"null".as_slice(), b"invalid".as_slice()] {
+            fs::write(&catalog, bytes).unwrap();
+            assert!(
+                resolve_direct_llama_model(&manifest, "qwen-smoke")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        fs::remove_file(&catalog).unwrap();
+        fs::create_dir(&catalog).unwrap();
+        assert!(
+            resolve_direct_llama_model(&manifest, "qwen-smoke")
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -498,7 +766,6 @@ mod tests {
         for checkpoint in [
             "../../etc/passwd:Q4_0",
             "owner/repo:../secret",
-            "owner/repo",
             "/tmp/model.gguf",
         ] {
             write_registry(
@@ -568,6 +835,8 @@ mod tests {
             "exact-gguf",
             "Exact",
             "../../escape",
+            "NoCheckpoint",
+            "MalformedCheckpoint",
         ] {
             assert!(
                 resolve_direct_llama_model(&manifest, name)
@@ -576,19 +845,18 @@ mod tests {
                 "{name}"
             );
         }
-        for name in ["NoCheckpoint", "MalformedCheckpoint", "owner/repo"] {
-            assert!(
-                resolve_direct_llama_model(&manifest, name).is_err(),
-                "{name}"
-            );
-        }
+        assert!(resolve_direct_llama_model(&manifest, "owner/repo").is_err());
         for json in [b"[]".as_slice(), b"invalid".as_slice()] {
             fs::write(
                 manifest.runtime_dir.join("resources/server_models.json"),
                 json,
             )
             .unwrap();
-            assert!(resolve_direct_llama_model(&manifest, "Exact-GGUF").is_err());
+            assert!(
+                resolve_direct_llama_model(&manifest, "Exact-GGUF")
+                    .unwrap()
+                    .is_none()
+            );
         }
         fs::remove_dir_all(dir).unwrap();
     }

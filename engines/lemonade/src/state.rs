@@ -141,6 +141,24 @@ pub(crate) fn write_running_state(
     server_pid: Option<u32>,
     status: &str,
 ) -> Result<()> {
+    write_running_state_for_model(
+        request,
+        runtime,
+        pid,
+        server_pid,
+        status,
+        &request.model_ref,
+    )
+}
+
+pub(crate) fn write_running_state_for_model(
+    request: &ServeHttpRequest,
+    runtime: &LemonadeRuntime,
+    pid: u32,
+    server_pid: Option<u32>,
+    status: &str,
+    served_model_ref: &str,
+) -> Result<()> {
     write_state(
         &request.state_path,
         &json!({
@@ -150,7 +168,7 @@ pub(crate) fn write_running_state(
             "pid": pid,
             "server_pid": server_pid,
             "model_ref": request.model_ref,
-            "canonical_model_id": request.model_ref,
+            "canonical_model_id": served_model_ref,
             "host": request.host,
             "port": request.port,
             "endpoint_url": endpoint_url(&request.host, request.port),

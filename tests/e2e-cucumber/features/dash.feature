@@ -349,6 +349,10 @@ Feature: Interactive dashboard
     When the user opens the dashboard
     And the user opens the Observe view
     Then both external protocol models are displayed with truthful throughput
+    When the user opens the managed services overlay
+    Then the Services overlay has no managed servers
+    When the user attempts to stop and restart the external models
+    Then the external protocol fixture remains alive without managed records
     When the user selects engine status in the Serving view
     Then Lemonade is shown as externally running without a managed installation
     When the user quits the dashboard
@@ -370,6 +374,6 @@ Feature: Interactive dashboard
     When the external protocol fixture becomes unreachable
     Then neither external protocol model is displayed
     When the user selects engine status in the Serving view
-    Then Serving actions are displayed
+    Then Lemonade returns to the managed installation status without external availability
     When the user quits the dashboard
     Then the dashboard exits successfully

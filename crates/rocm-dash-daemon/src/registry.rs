@@ -23,12 +23,15 @@
 //! (`EngineKind::default_port`, `docker.rs`, `lemonade.rs`) remain only as a
 //! fallback for *unmanaged/external* discovery.
 //!
-//! **Co-located scope (known limitation):** scrape targets carry only a port;
-//! the runner's vLLM collector scrapes `opts.vllm_metrics_host` (default
-//! `127.0.0.1`), so `record.host` is honored only for the co-located daemon
-//! (the same assumption the Docker-discovery path already makes). A managed
-//! service on a non-loopback host is surfaced but its metrics are scraped at the
-//! local address. Per-host scrape targeting is tracked as a D7 follow-up.
+//! **Lifecycle ownership:** only this registry seam marks discovered services
+//! as managed. External protocol and container discovery remain read-only;
+//! instance ids and engine markers are not evidence of lifecycle ownership.
+//!
+//! **Host scope:** managed Lemonade telemetry honors `record.host` and port.
+//! The vLLM collector still scrapes `opts.vllm_metrics_host` (default
+//! `127.0.0.1`) at the record's port, so a non-loopback vLLM service is surfaced
+//! but its metrics use the configured collector host. External Lemonade
+//! discovery uses its own configured host and port.
 
 use std::collections::HashSet;
 use std::fs;
@@ -163,6 +166,7 @@ pub fn discovered_from_record(record: &ServiceRecord) -> Option<DiscoveredServic
         record.model_ref.clone()
     };
     Some(DiscoveredService {
+        managed: true,
         container_id: record.service_id.clone(),
         container_name: record.service_id.clone(),
         model_name,
@@ -404,6 +408,7 @@ mod tests {
         .unwrap();
         let records = load_service_records(&dir);
         let svc = discovered_from_record(&records[0]).expect("live record converts");
+        assert!(svc.managed, "registry discovery proves lifecycle ownership");
         assert_eq!(svc.port, Some(8123));
         assert_eq!(svc.container_id, "svc-hot");
         assert_eq!(svc.model_name, "meta-llama/Llama-3.1-8B");

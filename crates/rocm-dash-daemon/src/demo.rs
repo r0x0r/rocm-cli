@@ -610,6 +610,7 @@ fn build_instances(t_s: f64, seed: &mut u64) -> Vec<Instance> {
             };
 
             Instance {
+                managed: false,
                 container_id: c.container_id.into(),
                 container_name: c.container_name.into(),
                 status: InstanceStatus::Running,

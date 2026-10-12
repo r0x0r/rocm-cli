@@ -974,6 +974,7 @@ mod tests {
 
     fn mk_inst(name: &str) -> Instance {
         Instance {
+            managed: false,
             container_id: format!("id-{name}"),
             container_name: name.to_string(),
             status: InstanceStatus::Running,

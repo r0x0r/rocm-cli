@@ -127,10 +127,14 @@ async fn lemonade_fixture(
                     unexpected.fetch_add(1, Ordering::Relaxed);
                     "{}".to_string()
                 };
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
+                let response = if body == "HTTP_503" {
+                    HTTP_503.to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
                 let _ = socket.write_all(response.as_bytes()).await;
             });
         }
@@ -144,7 +148,11 @@ async fn lemonade_multiple_models_keep_identity_and_do_not_share_last_request_ra
     let unexpected = Arc::new(AtomicU64::new(0));
     let (port, server) = lemonade_fixture(health.clone(), unexpected.clone()).await;
     let (tx, mut rx) = broadcast::channel(64);
+    let clock_dir = tempfile::tempdir().unwrap();
+    let clock = clock_dir.path().join("clock");
+    std::fs::write(&clock, "hold").unwrap();
     let opts = RunnerOptions {
+        test_clock_offset_path: Some(clock),
         enable_lemonade: true,
         lemonade_port: port,
         disable_vllm_metrics: false,
@@ -200,15 +208,23 @@ async fn lemonade_multiple_models_keep_identity_and_do_not_share_last_request_ra
     })
     .await
     .expect("unloaded model disappears; singleton receives rate");
+    // Freeze observation time: expiry cannot make a missing invalidation pass,
+    // even if the test is descheduled or waits through its entire deadline.
+    drain_snapshots(&mut rx);
     *health.lock().unwrap() =
         r#"{"status":"ok","model_loaded":"Model-A","all_models_loaded":["Model-A","Model-B"]}"#
             .to_string();
-    wait_for_snapshot(&mut rx, |snap| {
-        (snap.instances.len() == 2 && snap.instances.iter().all(|row| row.gen_tps.is_none()))
-            .then_some(())
+    let ambiguous = wait_for_snapshot(&mut rx, |snap| {
+        (snap.instances.len() == 2).then(|| snap.instances.clone())
     })
     .await
-    .expect("adding another model clears previously attributed rate immediately");
+    .expect("adding another model produces both rows on the next discovery");
+    assert!(
+        ambiguous
+            .iter()
+            .all(|row| row.gen_tps.is_none() && row.gen_tps_observation.is_none()),
+        "the first multi-model snapshot must invalidate the singleton rate and observation"
+    );
     *health.lock().unwrap() =
         r#"{"status":"error","all_models_loaded":["Model-A","Model-B"]}"#.to_string();
     wait_for_snapshot(&mut rx, |snap| snap.instances.is_empty().then_some(()))
@@ -254,6 +270,7 @@ async fn lemonade_managed_nondefault_port_scrapes_even_when_external_discovery_d
     let result = wait_for_snapshot(&mut rx, |snap| {
         (snap.instances.len() == 1
             && snap.instances[0].container_id == "managed-lemonade"
+            && snap.instances[0].managed
             && snap.instances[0].gen_tps == Some(42.0))
         .then_some(())
     })
@@ -261,6 +278,43 @@ async fn lemonade_managed_nondefault_port_scrapes_even_when_external_discovery_d
     task.abort();
     server.abort();
     result.expect("managed Lemonade is scraped at its registry port without external discovery");
+    assert_eq!(unexpected.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn lemonade_equivalent_endpoint_records_do_not_duplicate_singleton_rate() {
+    let health = Arc::new(Mutex::new(
+        r#"{"status":"ok","model_loaded":"Model-A"}"#.to_string(),
+    ));
+    let unexpected = Arc::new(AtomicU64::new(0));
+    let (port, server) = lemonade_fixture(health, unexpected.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    for (id, host) in [("first", "127.0.0.1"), ("second", "LOCALHOST")] {
+        std::fs::write(dir.path().join(format!("{id}.json")), format!(r#"{{"service_id":"{id}","engine":"lemonade","model_ref":"Model-A","host":"{host}","port":{port},"status":"ready"}}"#)).unwrap();
+    }
+    let (tx, mut rx) = broadcast::channel(64);
+    let task = spawn_runner(
+        tx,
+        RunnerOptions {
+            services_dir: Some(dir.path().to_path_buf()),
+            discovery_tick: TICK,
+            instance_tick: TICK,
+            ..RunnerOptions::default()
+        },
+    )
+    .await;
+    let result = wait_for_snapshot(&mut rx, |snap| {
+        (snap.instances.len() == 2).then(|| snap.instances.clone())
+    })
+    .await;
+    task.abort();
+    server.abort();
+    let rows = result.expect("both registry identities remain present");
+    assert!(
+        rows.iter()
+            .all(|row| row.managed && row.gen_tps.is_none() && row.gen_tps_observation.is_none()),
+        "equivalent endpoint records cannot each receive its singleton rate: {rows:?}"
+    );
     assert_eq!(unexpected.load(Ordering::Relaxed), 0);
 }
 
@@ -294,10 +348,9 @@ async fn lemonade_external_endpoint_deduplicates_managed_owner_then_reappears_af
     std::fs::remove_file(record).unwrap();
     wait_for_snapshot(&mut rx, |snap| {
         (snap.instances.len() == 2
-            && snap
-                .instances
-                .iter()
-                .all(|row| row.container_id != "managed-lemonade" && row.gen_tps.is_none()))
+            && snap.instances.iter().all(|row| {
+                !row.managed && row.container_id != "managed-lemonade" && row.gen_tps.is_none()
+            }))
         .then_some(())
     })
     .await
@@ -305,6 +358,216 @@ async fn lemonade_external_endpoint_deduplicates_managed_owner_then_reappears_af
     task.abort();
     server.abort();
     assert_eq!(unexpected.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn lemonade_external_health_failure_warns_and_removes_rows_without_grace() {
+    let health = Arc::new(Mutex::new(
+        r#"{"status":"ok","model_loaded":"Model-A"}"#.to_string(),
+    ));
+    let unexpected = Arc::new(AtomicU64::new(0));
+    let (port, server) = lemonade_fixture(health.clone(), unexpected.clone()).await;
+    let (tx, mut rx) = broadcast::channel(64);
+    let task = spawn_runner(
+        tx,
+        RunnerOptions {
+            enable_lemonade: true,
+            lemonade_port: port,
+            discovery_tick: TICK,
+            instance_tick: TICK,
+            ..RunnerOptions::default()
+        },
+    )
+    .await;
+    wait_for_snapshot(&mut rx, |snap| {
+        (snap.instances.len() == 1 && snap.instances[0].gen_tps == Some(42.0)).then_some(())
+    })
+    .await
+    .expect("external singleton established");
+    drain_snapshots(&mut rx);
+    *health.lock().unwrap() = "HTTP_503".to_string();
+    let result = wait_for_snapshot(&mut rx, |snap| {
+        snap.instances.is_empty().then(|| snap.warnings.clone())
+    })
+    .await;
+    task.abort();
+    server.abort();
+    let warnings = result.expect("external failure removes rows on next discovery, without grace");
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("lemonade health")
+                && warning.contains(&port.to_string())
+                && warning.contains("503")),
+        "failed disappearance carries the health error: {warnings:?}"
+    );
+    assert_eq!(unexpected.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn lemonade_never_seen_absent_external_endpoint_is_quiet() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let (tx, mut rx) = broadcast::channel(64);
+    let task = spawn_runner(
+        tx,
+        RunnerOptions {
+            enable_lemonade: true,
+            lemonade_port: port,
+            discovery_tick: TICK,
+            instance_tick: TICK,
+            ..RunnerOptions::default()
+        },
+    )
+    .await;
+    let snap = wait_for_snapshot(&mut rx, |snap| Some(snap.clone())).await;
+    task.abort();
+    let snap = snap.expect("absent endpoint does not block snapshots");
+    assert!(snap.instances.is_empty());
+    assert!(
+        !snap
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("lemonade")),
+        "normal absent external endpoint is not a noisy warning"
+    );
+}
+
+/// A slow health response can finish only after the other endpoint's stats
+/// request. Both serial orders fail: fast health waits for slow health to start.
+#[tokio::test]
+async fn lemonade_independent_endpoints_overlap_and_health_failures_warn() {
+    let slow_started = Arc::new(tokio::sync::Notify::new());
+    let fast_stats = Arc::new(tokio::sync::Notify::new());
+    let fast_stats_count = Arc::new(AtomicU64::new(0));
+    let failed = Arc::new(AtomicBool::new(false));
+    let unexpected = Arc::new(AtomicU64::new(0));
+    let mut servers = Vec::new();
+    let dir = tempfile::tempdir().unwrap();
+    for (id, model, slow) in [("slow", "Model-S", true), ("fast", "Model-F", false)] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(dir.path().join(format!("{id}.json")), format!(r#"{{"service_id":"{id}","engine":"lemonade","model_ref":"{model}","host":"127.0.0.1","port":{port},"status":"ready"}}"#)).unwrap();
+        let slow_started = slow_started.clone();
+        let fast_stats = fast_stats.clone();
+        let fast_stats_count = fast_stats_count.clone();
+        let failed = failed.clone();
+        let unexpected = unexpected.clone();
+        let health_succeeded = Arc::new(AtomicBool::new(false));
+        servers.push(tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let slow_started = slow_started.clone();
+                let fast_stats = fast_stats.clone();
+                let fast_stats_count = fast_stats_count.clone();
+                let failed = failed.clone();
+                let unexpected = unexpected.clone();
+                let health_succeeded = health_succeeded.clone();
+                tokio::spawn(async move {
+                    let mut bytes = [0; 4096];
+                    let n = socket.read(&mut bytes).await.unwrap();
+                    let request = String::from_utf8_lossy(&bytes[..n]);
+                    let response = if request.starts_with("GET /api/v1/health ") {
+                        health_succeeded.store(false, Ordering::SeqCst);
+                        if slow && failed.load(Ordering::SeqCst) {
+                            HTTP_503.to_string()
+                        } else {
+                            let overlap = if slow {
+                                slow_started.notify_one();
+                                timeout(Duration::from_secs(1), fast_stats.notified()).await
+                            } else {
+                                timeout(Duration::from_secs(1), slow_started.notified()).await
+                            };
+                            if overlap.is_ok() {
+                                health_succeeded.store(true, Ordering::SeqCst);
+                                http_ok(&format!(r#"{{"status":"ok","model_loaded":"{model}"}}"#))
+                            } else {
+                                HTTP_503.to_string()
+                            }
+                        }
+                    } else if request.starts_with("GET /api/v1/stats ") {
+                        if !health_succeeded.swap(false, Ordering::SeqCst) {
+                            unexpected.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if !slow {
+                            fast_stats_count.fetch_add(1, Ordering::SeqCst);
+                            fast_stats.notify_one();
+                        }
+                        http_ok(r#"{"tokens_per_second":42.0}"#)
+                    } else {
+                        unexpected.fetch_add(1, Ordering::Relaxed);
+                        HTTP_503.to_string()
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        }));
+    }
+    let (tx, mut rx) = broadcast::channel(64);
+    let clock = dir.path().join("clock");
+    std::fs::write(&clock, "hold").unwrap();
+    let task = spawn_runner(
+        tx,
+        RunnerOptions {
+            services_dir: Some(dir.path().to_path_buf()),
+            discovery_tick: TICK,
+            instance_tick: TICK,
+            test_clock_offset_path: Some(clock),
+            ..RunnerOptions::default()
+        },
+    )
+    .await;
+    let overlap = wait_for_snapshot(&mut rx, |snap| {
+        (snap.instances.len() == 2).then(|| snap.instances.clone())
+    })
+    .await;
+    if overlap.is_err() {
+        task.abort();
+        for server in &servers {
+            server.abort();
+        }
+    }
+    let rows = overlap.expect("both registry rows appear in the first scrape snapshot");
+    assert!(
+        rows.iter().all(|row| row.gen_tps == Some(42.0)),
+        "independent endpoint health and stats must overlap in the same cycle, not run serially: {rows:?}"
+    );
+    drain_snapshots(&mut rx);
+    let previous_fast_stats = fast_stats_count.load(Ordering::SeqCst);
+    failed.store(true, Ordering::SeqCst);
+    // Allow fast health through while slow health is now failing immediately.
+    slow_started.notify_one();
+    let failure = wait_for_snapshot(&mut rx, |snap| {
+        snap.warnings
+            .iter()
+            .any(|warning| {
+                warning.contains("lemonade health")
+                    && warning.contains("slow")
+                    && warning.contains("503")
+            })
+            .then(|| snap.instances.clone())
+    })
+    .await;
+    task.abort();
+    for server in servers {
+        server.abort();
+    }
+    let rows =
+        failure.expect("health failures must produce endpoint/row-context snapshot warnings");
+    assert!(
+        fast_stats_count.load(Ordering::SeqCst) > previous_fast_stats,
+        "independent fast endpoint completes another stats scrape during slow health failure"
+    );
+    assert!(
+        rows.iter().all(|row| row.gen_tps == Some(42.0)),
+        "failed health holds existing rates; independent fast endpoint still scrapes"
+    );
+    assert_eq!(
+        unexpected.load(Ordering::Relaxed),
+        0,
+        "only health-before-stats reads are permitted"
+    );
 }
 
 // ── Timing constants ────────────────────────────────────────────────────────

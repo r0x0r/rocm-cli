@@ -256,6 +256,15 @@ a tiny model. rocm-cli helps in three ways:
   one intact single-quoted argument; a line carrying an apostrophe or terminal
   control bytes falls back to the canonical symptom below rather than handing you
   a command whose quoting the log text broke.
+- **Import failures point at diagnose.** When a startup failure log shows the
+  engine failing to import (for example `libtorch_cuda.so: cannot open shared
+  object file`), the failure message names the failing line and points at
+  `rocm diagnose --symptom '<the error>'`. The same quoting rule applies: a
+  line that cannot be quoted safely, or that diagnose does not recognise,
+  falls back to the canonical symptom. The command only reports. On Linux it
+  matches the engine reinstall remediation, which `rocm fix` prints and does
+  not run. A failure that is neither out of memory nor an import error prints
+  only the log tail.
 
 Explicitly, the workaround for an OOM on a shared card is:
 

@@ -1843,6 +1843,34 @@ fn check_18_comgr_conflict(e: &Examination, symptom: &str) -> Diagnosis {
     finalize(ID, TITLE, score, evidence, fix)
 }
 
+/// A canonical engine-startup import-failure `--symptom` string guaranteed to
+/// clear [`MIN_SCORE_FOR_MATCH`].
+///
+/// `libtorch_cuda.so` is the one token in that traceback that cannot mean
+/// anything else (a ROCm build of torch ships `libtorch_hip.so` and never that
+/// file), and it is worth exactly the threshold on its own on purpose; see
+/// [`KEYWORDS_TORCH_DLPACK_CUDA_VARIANT`]. The vLLM engine falls back to this when
+/// the user's actual failing line would not itself be diagnosable, so the
+/// `rocm diagnose` command it prints always reports a cause.
+pub const VLLM_IMPORT_CANONICAL_SYMPTOM: &str =
+    "OSError: libtorch_cuda.so: cannot open shared object file";
+
+/// Whether `symptom` clears [`MIN_SCORE_FOR_MATCH`] for the engine-startup
+/// import failure.
+///
+/// The vLLM engine calls this to decide whether the user's actual failing line
+/// is worth routing into a `--symptom` example, or whether to fall back to
+/// [`VLLM_IMPORT_CANONICAL_SYMPTOM`] so the printed command is guaranteed to
+/// report a cause rather than reading as "the tool checked and found nothing".
+#[must_use]
+pub fn vllm_import_symptom_is_diagnosable(symptom: &str) -> bool {
+    let e = Examination {
+        os_family: "linux".to_owned(),
+        ..Examination::default()
+    };
+    check_17_torch_dlpack_cuda_variant(&e, symptom).score >= MIN_SCORE_FOR_MATCH
+}
+
 /// The vLLM engine-startup import failure (EAI-8012).
 ///
 /// Keyword-only, and not by preference. The fact that decides this failure is
@@ -1854,15 +1882,15 @@ fn check_18_comgr_conflict(e: &Examination, symptom: &str) -> Diagnosis {
 /// why the parameter is unused: the user has to supply the error text through
 /// `rocm diagnose --symptom "<pasted error>"`.
 ///
-/// That is the only route to this entry from the symptom, and it is a narrow
-/// one: nothing on the serve or `rocm services` path points at `rocm diagnose`
-/// at all — a service that died at startup renders a `logs:` and a `restart:`
-/// hint and no more — so reaching this requires already knowing to paste the
-/// error into `diagnose`. The recipe is also reachable by name (`rocm fix` lists
-/// it, `rocm fix fix-17-torch-dlpack` prints it), but that needs the id rather
-/// than the symptom. Closing that gap means adding a diagnose hint to the
-/// service-failure output, which changes a shared surface for every failed
-/// service regardless of cause and belongs in its own change.
+/// That is the only route to this entry from the symptom. The vLLM engine's own
+/// startup-failure message now points at it (`import_failure_hint` in
+/// `engines/vllm`, which prints `rocm diagnose --symptom '<the error line>'`),
+/// but only for that engine. A service that died at startup for any other reason
+/// still renders a `logs:` and a `restart:` hint and no more, because adding a
+/// diagnose hint there changes a shared surface for every failed service
+/// regardless of cause and belongs in its own change. The recipe is also
+/// reachable by name (`rocm fix` lists it, `rocm fix fix-17-torch-dlpack` prints
+/// it), but that needs the id rather than the symptom.
 fn check_17_torch_dlpack_cuda_variant(_e: &Examination, symptom: &str) -> Diagnosis {
     let (score, evidence) = keyword_score(symptom, KEYWORDS_TORCH_DLPACK_CUDA_VARIANT);
     if score <= 0 {
@@ -5495,6 +5523,21 @@ mod tests {
             oom.score,
             oom.evidence
         );
+    }
+
+    #[test]
+    fn canonical_vllm_import_symptom_is_diagnosable() {
+        // The engine's fallback symptom must always clear the threshold, so the
+        // `rocm diagnose` command it prints never reports nothing.
+        assert!(vllm_import_symptom_is_diagnosable(
+            VLLM_IMPORT_CANONICAL_SYMPTOM
+        ));
+        // A frame that names only the shim's module, and not the missing library,
+        // is not enough on its own, and the engine has to know that.
+        assert!(!vllm_import_symptom_is_diagnosable(
+            "File \"tvm_ffi/_optional_torch_c_dlpack.py\", line 42, in <module>"
+        ));
+        assert!(!vllm_import_symptom_is_diagnosable("an ordinary failure"));
     }
 
     #[test]

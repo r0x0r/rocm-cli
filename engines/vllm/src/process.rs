@@ -717,9 +717,9 @@ fn prepend_path_entries(entries: &[PathBuf], current: Option<OsString>) -> Resul
 /// stripping control bytes out of the one echoed line further down while
 /// printing the raw tail a few lines above would have left the escapes a clear
 /// path to the terminal inside the same message. Stripping is per line so the
-/// tail keeps its shape; `oom_utilization_hint` still reads the *raw* tail,
-/// because what it selects from it is quoted into a command and has its own,
-/// stricter admissibility test.
+/// tail keeps its shape; `oom_utilization_hint` and `import_failure_hint` still
+/// read the *raw* tail, because what they select from it is quoted into a
+/// command and has its own, stricter admissibility test.
 fn startup_log_context(log_path: Option<&Path>) -> String {
     let summary = log_path
         .and_then(|p| summarize_startup_log_tail(p, STARTUP_FAILURE_LOG_TAIL_LINES).ok())
@@ -727,7 +727,11 @@ fn startup_log_context(log_path: Option<&Path>) -> String {
     if summary.is_empty() {
         return String::new();
     }
-    let hint = oom_utilization_hint(&summary);
+    let hint = format!(
+        "{}{}",
+        oom_utilization_hint(&summary),
+        import_failure_hint(&summary)
+    );
     let summary = summary
         .lines()
         .map(strip_terminal_control_sequences)
@@ -822,6 +826,65 @@ fn quotable_in_single_quotes(symptom: &str) -> bool {
 fn log_tail_shows_oom(log_tail: &str) -> bool {
     let lower = log_tail.to_ascii_lowercase();
     lower.contains("out of memory") || lower.contains("outofmemory")
+}
+
+/// Points at `rocm diagnose` when the startup-log tail shows the engine import
+/// failure (`OSError: libtorch_cuda.so: cannot open shared object file`), and
+/// prints nothing otherwise. It is the sibling of [`oom_utilization_hint`]:
+/// without it, reaching the catalog entry for this failure meant already knowing
+/// to paste the error into `rocm diagnose`.
+///
+/// The message says only what was detected. The catalog entry carries the
+/// conditions under which its remediation applies, so this does not advise a
+/// reinstall itself.
+///
+/// The quoted symptom follows the same rule as the out-of-memory hint: the
+/// user's own line when the checker scores it and it renders as one intact
+/// single-quoted argument, the canonical symptom otherwise, so the printed
+/// command always reports a cause.
+fn import_failure_hint(log_tail: &str) -> String {
+    let Some(raw_line) = import_failure_line(log_tail) else {
+        return String::new();
+    };
+    // The line is subprocess output, so it is echoed only after the terminal
+    // control bytes the engine's colourised logger emits are removed.
+    let symptom_line = strip_terminal_control_sequences(raw_line);
+    let symptom = if quotable_in_single_quotes(raw_line)
+        && rocm_core::vllm_import_symptom_is_diagnosable(raw_line)
+    {
+        raw_line
+    } else {
+        rocm_core::VLLM_IMPORT_CANONICAL_SYMPTOM
+    };
+    format!(
+        "\n\nDetected an engine import failure ({symptom_line}).\n\
+         For conditional remediation, run `rocm diagnose --symptom '{symptom}'`."
+    )
+}
+
+/// The line of the tail that names the import failure, if there is one.
+///
+/// The line that names the missing library is the proximate failure, so it wins
+/// and the last one is taken. The frame of the extension's loader is the
+/// fallback, and `torch_c_dlpack_ext` alone is deliberately not a signature: it
+/// also appears in healthy package listings, and a hint on an unrelated failure
+/// is worse than none.
+fn import_failure_line(log_tail: &str) -> Option<&str> {
+    let lines = || {
+        log_tail
+            .lines()
+            .rev()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+    };
+    lines()
+        .find(|line| line.to_ascii_lowercase().contains("libtorch_cuda.so"))
+        .or_else(|| {
+            lines().find(|line| {
+                line.to_ascii_lowercase()
+                    .contains("_optional_torch_c_dlpack")
+            })
+        })
 }
 
 /// Polls the vLLM endpoint until it reports the model is loaded, or times out.
@@ -1457,6 +1520,157 @@ mod tests {
             oom_utilization_hint(unrelated).is_empty(),
             "non-OOM failures must not carry a memory hint"
         );
+    }
+
+    // ── The engine import failure: a pointer at `rocm diagnose` ──────────────
+
+    /// A startup-log tail as the engine writes it when the extension loads its
+    /// CUDA variant on a ROCm build of torch.
+    const IMPORT_TRACEBACK: &str = "\
+(EngineCore pid=412) Traceback (most recent call last):
+(EngineCore pid=412)   File \"/opt/venv/lib/python3.12/site-packages/tvm_ffi/_optional_torch_c_dlpack.py\", line 98, in load_torch_c_dlpack_extension
+(EngineCore pid=412)     lib = ctypes.CDLL(str(lib_path))
+(EngineCore pid=412) OSError: libtorch_cuda.so: cannot open shared object file: No such file or directory";
+
+    #[test]
+    fn import_failure_hint_names_the_failing_line_and_the_diagnose_command() {
+        let hint = import_failure_hint(IMPORT_TRACEBACK);
+        let line = "(EngineCore pid=412) OSError: libtorch_cuda.so: cannot open shared object file: No such file or directory";
+        assert_eq!(
+            hint,
+            format!(
+                "\n\nDetected an engine import failure ({line}).\n\
+                 For conditional remediation, run `rocm diagnose --symptom '{line}'`."
+            ),
+            "the line that names the missing library is the one to quote, verbatim"
+        );
+        assert!(
+            rocm_core::vllm_import_symptom_is_diagnosable(quoted_symptom_argument(&hint)),
+            "the command the hint prints must report a cause: {hint}"
+        );
+    }
+
+    #[test]
+    fn import_failure_hint_is_part_of_the_startup_failure_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("vllm.log");
+        std::fs::write(&log, IMPORT_TRACEBACK).expect("write log");
+        let context = startup_log_context(Some(&log));
+        assert!(
+            context.contains("Last 80 lines of startup log:"),
+            "{context}"
+        );
+        assert!(
+            context.contains("rocm diagnose --symptom 'OSError: libtorch_cuda.so")
+                || context.contains("rocm diagnose --symptom '(EngineCore pid=412) OSError"),
+            "the user must be pointed at the diagnosis from the failure message: {context}"
+        );
+        assert!(
+            !context.contains("--gpu-memory-utilization"),
+            "an import failure must not carry the memory hint: {context}"
+        );
+    }
+
+    #[test]
+    fn every_emitted_import_symptom_is_diagnosable_and_names_the_branch_that_produced_it() {
+        // The same loop-closing check as the out-of-memory sweep, and for the
+        // same reason: the engine prints `rocm diagnose --symptom '<symptom>'`,
+        // so whatever it emits has to score. Each case pins the exact symptom, so
+        // the routing branch and the fallback branch are separately falsifiable
+        // (a mutant that always returns the canonical symptom would otherwise
+        // satisfy every diagnosability assertion).
+        let cases = [
+            // The library line scores on its own and is quoted verbatim. (Not the
+            // canonical string itself, which would make the two branches
+            // indistinguishable here.)
+            (
+                "ImportError: libtorch_cuda.so: cannot open shared object file",
+                "ImportError: libtorch_cuda.so: cannot open shared object file",
+            ),
+            (
+                "(EngineCore pid=1) OSError: libtorch_cuda.so: cannot open shared object file: No such file or directory",
+                "(EngineCore pid=1) OSError: libtorch_cuda.so: cannot open shared object file: No such file or directory",
+            ),
+            // A frame that names only the shim's module is worth 35, below the
+            // threshold, so it falls back. (The same frame with the loader
+            // function's name adds a second signal and scores on its own.)
+            (
+                "File \"tvm_ffi/_optional_torch_c_dlpack.py\", line 98, in <module>",
+                rocm_core::VLLM_IMPORT_CANONICAL_SYMPTOM,
+            ),
+            // An apostrophe cannot be quoted safely, so it falls back too.
+            (
+                "OSError: libtorch_cuda.so: can't open shared object file",
+                rocm_core::VLLM_IMPORT_CANONICAL_SYMPTOM,
+            ),
+        ];
+        let mut routed_verbatim = 0;
+        for (line, expected) in cases {
+            let hint = import_failure_hint(line);
+            let symptom = quoted_symptom_argument(&hint);
+            assert_eq!(
+                symptom, expected,
+                "wrong branch for {line:?}: quote the user's own line when the checker scores \
+                 it and it is safe to quote, and fall back to the canonical symptom otherwise"
+            );
+            assert!(
+                rocm_core::vllm_import_symptom_is_diagnosable(symptom),
+                "emitted symptom must be diagnosable, got {symptom:?} for line {line:?}"
+            );
+            if symptom != rocm_core::VLLM_IMPORT_CANONICAL_SYMPTOM {
+                routed_verbatim += 1;
+            }
+        }
+        assert_eq!(
+            routed_verbatim, 2,
+            "the table must keep exercising both branches; if a scoring change moved a line \
+             across the threshold, re-pick the fixture rather than relaxing the expectation"
+        );
+    }
+
+    #[test]
+    fn control_bytes_from_the_log_are_stripped_from_the_echoed_import_line() {
+        let log_tail =
+            "\u{1b}[31mOSError: libtorch_cuda.so: cannot open shared object file\u{1b}[0m\u{7}";
+        let hint = import_failure_hint(log_tail);
+        assert!(
+            !hint.chars().any(|c| c.is_control() && c != '\n'),
+            "no control byte may survive into the printed hint: {hint:?}"
+        );
+        assert_eq!(
+            hint,
+            format!(
+                "\n\nDetected an engine import failure (OSError: libtorch_cuda.so: cannot open shared object file).\n\
+                 For conditional remediation, run `rocm diagnose --symptom '{}'`.",
+                rocm_core::VLLM_IMPORT_CANONICAL_SYMPTOM
+            ),
+            "the colourised line is not quotable, so the command falls back while the sentence \
+             keeps the user's own line, stripped"
+        );
+    }
+
+    #[test]
+    fn import_failure_hint_stays_quiet_for_unrelated_failures() {
+        for unrelated in [
+            "ValueError: model architecture 'FooForCausalLM' is not supported",
+            "torch.OutOfMemoryError: HIP out of memory",
+            // The extension named in a healthy package listing is not a failure.
+            "INFO torch-c-dlpack-ext 0.2.1 installed; torch_c_dlpack_ext loaded",
+            "",
+        ] {
+            assert!(
+                import_failure_hint(unrelated).is_empty(),
+                "must stay quiet for {unrelated:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_out_of_memory_tail_carries_no_import_pointer_and_an_import_tail_no_memory_hint() {
+        let oom = oom_utilization_hint("torch.OutOfMemoryError: HIP out of memory");
+        assert!(!oom.contains("import failure"), "{oom}");
+        let import = import_failure_hint(IMPORT_TRACEBACK);
+        assert!(!import.contains("out-of-memory"), "{import}");
     }
 
     #[test]

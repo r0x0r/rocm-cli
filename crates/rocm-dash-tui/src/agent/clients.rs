@@ -381,6 +381,12 @@ where
 /// values, so the derivation (precedence, empty-value handling, and the
 /// "home directory not found" error) is unit-testable without mutating or
 /// depending on the real environment.
+///
+/// This precedence (prefer `$HOME`) differs from `rocm-core`'s
+/// `runtime_home_dir`, which prefers `$USERPROFILE` on Windows — under Git
+/// Bash/MSYS the ChatGPT token cache can therefore land under a different
+/// home than the rest of `~/.rocm`. Pre-existing, unrelated to ROCMAI-200's
+/// dedup scope, and left as-is rather than changed here.
 fn token_dir_from_home(
     home: Option<std::ffi::OsString>,
     home_fallback: Option<std::ffi::OsString>,
@@ -438,13 +444,45 @@ impl ChatGptAgentClient {
     where
         F: Fn(String, String) + Send + Sync + 'static,
     {
+        Self::new_with_env(
+            |k| std::env::var_os(k),
+            model,
+            params,
+            on_device_code,
+            executor,
+            approval_tx,
+        )
+    }
+
+    /// As [`Self::new`], but takes the `$HOME`/`$USERPROFILE` lookup as a
+    /// function instead of reading the process environment directly.
+    ///
+    /// This is the seam a test needs to pin `new`'s own wiring into
+    /// [`token_dir_from_home`]: `new`'s only non-test caller
+    /// (`Self::new`) is one line, so without it a test can only exercise the
+    /// real environment, which can't tell a correct call apart from a
+    /// `HOME`/`USERPROFILE` swap on a host where only one of the two is ever
+    /// set (every Linux CI runner). See
+    /// `chatgpt_new_with_env_derives_token_dir_from_distinct_home_and_userprofile`.
+    pub(crate) fn new_with_env<F, L>(
+        lookup: L,
+        model: Option<String>,
+        params: InferenceParams,
+        on_device_code: F,
+        executor: Option<SharedRocmToolExecutor>,
+        approval_tx: Option<UnboundedSender<ClientMsg>>,
+    ) -> Result<Self, AgentError>
+    where
+        F: Fn(String, String) + Send + Sync + 'static,
+        L: Fn(&str) -> Option<std::ffi::OsString>,
+    {
         // Store OAuth tokens in a user-owned directory so the plaintext
         // access/refresh tokens are not readable by other local users.
         // Refuse to fall back to a predictable temp path: a pre-existing
         // directory there could be owned by another user.
         let token_dir = token_dir_from_home(
-            std::env::var_os("HOME"),
-            std::env::var_os("USERPROFILE"), // Windows
+            lookup("HOME"),
+            lookup("USERPROFILE"), // Windows
         )?;
         Self::new_in(
             token_dir,
@@ -770,7 +808,7 @@ impl AgentClient for MockAgentClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use crate::agent::{
         ROCM_MUTATING_TOOL_NAMES, ROCM_READ_TOOL_NAMES, SKILL_NAMES, fixture_snapshot,
@@ -785,12 +823,33 @@ mod tests {
     /// keeps reading and writing `auth.json` under it for its whole lifetime
     /// (inside `authorize()`) — callers must keep the guard alive for as long
     /// as the client itself is in use, not just until construction returns.
+    ///
+    /// "Never-pre-existing" is enforced, not assumed: a process-wide counter
+    /// is folded into the name (pids are reused across processes and
+    /// `ThreadId` numbering restarts in every process, so pid+tid alone can
+    /// collide), and the call panics if the resulting path already exists —
+    /// because `new_in`'s directory creation is `recursive(true)` precisely
+    /// so it can reuse an already-there `.rocm/data` on a real `$HOME`, so it
+    /// would silently reuse a leftover test directory too, which could let a
+    /// stale `auth.json` slip a test onto the cached-token fast path it means
+    /// to avoid.
     fn fresh_token_dir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "rocm-dash-chatgpt-{tag}-{}-{:?}",
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-dash-chatgpt-{tag}-{}-{:?}-{n}",
             std::process::id(),
             std::thread::current().id()
-        ))
+        ));
+        assert!(
+            !dir.exists(),
+            "fresh_token_dir must be never-pre-existing, but {} already exists \
+             (likely leaked by a crashed prior run); remove it before re-running \
+             the suite",
+            dir.display()
+        );
+        dir
     }
 
     /// Removes a [`fresh_token_dir`] directory when dropped — including on an
@@ -1038,6 +1097,24 @@ mod tests {
     }
 
     #[test]
+    fn token_dir_from_home_falls_back_to_userprofile_when_home_is_empty() {
+        // `token_dir_from_home_treats_empty_values_as_unset` above only tries
+        // an empty HOME alongside an empty USERPROFILE; a mutation that short-
+        // circuits to the "unset" error as soon as `home` is empty — without
+        // trying the fallback at all — would stay green there. This pins the
+        // fallback firing when HOME is empty but USERPROFILE is actually set.
+        let dir = token_dir_from_home(Some("".into()), Some("C:\\Users\\alice".into()))
+            .expect("empty HOME must still fall back to a set USERPROFILE");
+        assert_eq!(
+            dir,
+            std::path::PathBuf::from("C:\\Users\\alice")
+                .join(".rocm")
+                .join("data")
+                .join("chatgpt-tokens")
+        );
+    }
+
+    #[test]
     fn token_dir_from_home_errors_when_neither_is_set() {
         let err =
             token_dir_from_home(None, None).expect_err("must fail without $HOME or $USERPROFILE");
@@ -1064,19 +1141,24 @@ mod tests {
     /// front (`new`'s own doc comment's "No network I/O happens here" is
     /// about the OAuth login, not the filesystem). On success this also
     /// checks that the directory `token_dir_from_home` derives is the one
-    /// `new` actually created — catching `new`'s call site passing the wrong
-    /// directory to `new_in` (e.g. the two env values swapped, or a typo'd
-    /// var name) where both vars are set and differ, which a bare
-    /// `is_ok()`/`is_err()` comparison would miss. (A precedence bug inside
-    /// `token_dir_from_home` itself is already covered by the dedicated
-    /// `token_dir_from_home_*` tests above, since both `expected` and `new`
-    /// feed it the same two values in the same order.) Cleanup removes every
-    /// path segment this call created — not just the leaf — stopping at the
-    /// first ancestor that already existed, so a `$HOME` with no prior
-    /// `.rocm` directory at all doesn't leak one. Where `$HOME` exists but
-    /// isn't writable, `new` is expected to fail with
-    /// `Build("cannot create token cache dir…")`; that still counts as
-    /// agreement; a failure for any other reason does not.
+    /// `new` actually created, which a bare `is_ok()`/`is_err()` comparison
+    /// would miss. (A precedence bug inside `token_dir_from_home` itself is
+    /// already covered by the dedicated `token_dir_from_home_*` tests above,
+    /// since both `expected` and `new` feed it the same two values in the
+    /// same order.) Cleanup removes every path segment this call created —
+    /// not just the leaf — stopping at the first ancestor that already
+    /// existed, so a `$HOME` with no prior `.rocm` directory at all doesn't
+    /// leak one. Where `$HOME` exists but isn't writable, `new` is expected
+    /// to fail with `Build("cannot create token cache dir…")`; that still
+    /// counts as agreement; a failure for any other reason does not.
+    ///
+    /// This does NOT catch a `HOME`/`USERPROFILE` swap at `new`'s call site:
+    /// on every host where only one of the two is ever set (every Linux CI
+    /// runner, since `USERPROFILE` is Windows-only), `token_dir_from_home`'s
+    /// own fallback makes the swapped call land on the same directory as the
+    /// correct one. See
+    /// `chatgpt_new_with_env_derives_token_dir_from_distinct_home_and_userprofile`
+    /// below for that case, which sets both to distinct values deterministically.
     #[test]
     fn chatgpt_new_agrees_with_token_dir_from_home_on_the_real_environment() {
         let expected =
@@ -1129,6 +1211,49 @@ mod tests {
                 "token_dir_from_home failed on this environment but new() did not"
             ),
         }
+    }
+
+    /// Pins `new`'s wiring into `token_dir_from_home` deterministically: two
+    /// distinct, freshly-generated temp directories stand in for `$HOME` and
+    /// `$USERPROFILE`, so a swap at `new`'s call site (or a typo'd var name)
+    /// is caught on every host, unlike the real-environment test above,
+    /// which can't tell a swap apart from a correct call wherever only one
+    /// of the two is ever set.
+    #[test]
+    fn chatgpt_new_with_env_derives_token_dir_from_distinct_home_and_userprofile() {
+        let home_root = fresh_token_dir("new-with-env-home");
+        let profile_root = fresh_token_dir("new-with-env-profile");
+        let _cleanup_home = TokenDirGuard(home_root.clone());
+        let _cleanup_profile = TokenDirGuard(profile_root.clone());
+
+        let home_os = home_root.clone().into_os_string();
+        let profile_os = profile_root.clone().into_os_string();
+        let result = ChatGptAgentClient::new_with_env(
+            move |k| match k {
+                "HOME" => Some(home_os.clone()),
+                "USERPROFILE" => Some(profile_os.clone()),
+                _ => None,
+            },
+            None,
+            InferenceParams::default(),
+            |_, _| panic!("device-code callback must not fire during construction"),
+            None,
+            None,
+        );
+        if let Err(e) = &result {
+            panic!("expected new_with_env to succeed: {e}");
+        }
+
+        let expected_dir = home_root.join(".rocm").join("data").join("chatgpt-tokens");
+        assert!(
+            expected_dir.is_dir(),
+            "new_with_env must create the token dir under HOME, not USERPROFILE: {}",
+            expected_dir.display()
+        );
+        assert!(
+            !profile_root.join(".rocm").exists(),
+            "new_with_env must not have written anything under USERPROFILE when HOME is set"
+        );
     }
 
     #[test]
@@ -1609,6 +1734,130 @@ mod tests {
             content.first(),
             UserContent::Text(t) if t.text == "check gpu 0 again"
         ));
+    }
+
+    /// Pins the one remaining branch inside `run_agent_request` the two tests
+    /// above never take: an empty history. Both Rig and Anthropic now reach
+    /// `AgentError::Empty` only through `history.split_last()` here (ChatGPT
+    /// still has its own earlier guard) — nothing calls `run_agent_request`
+    /// with `&[]`, so a swap to a different error, or a change that lets an
+    /// empty history reach the model, would stay green.
+    #[tokio::test]
+    async fn run_agent_request_returns_empty_for_an_empty_history() {
+        use rig::test_utils::MockCompletionModel;
+
+        let model = MockCompletionModel::new([]);
+        let recorded = model.clone();
+        let agent = rig::agent::AgentBuilder::new(model).preamble(DEFAULT_PREAMBLE);
+
+        let err = run_agent_request(
+            agent,
+            &InferenceParams::default(),
+            None,
+            None,
+            &[],
+            fixture_snapshot(),
+            "mock-test",
+        )
+        .await
+        .expect_err("an empty history must be rejected before any request is built");
+
+        assert!(matches!(err, AgentError::Empty), "got: {err:?}");
+        assert_eq!(
+            recorded.request_count(),
+            0,
+            "no request should reach the model for an empty history"
+        );
+    }
+
+    /// Pins the other wiring `run_agent_request` moved to its one shared
+    /// site: the optional ROCm tool executor and the mutating-tool approval
+    /// channel. Both tests above pass `None` for each, so a dropped forward —
+    /// e.g. `None` replacing `executor`/`approval_tx` at the call into
+    /// `register_rocm_read_tools`/`register_rocm_mutating_tools` — would stay
+    /// green. Scripts one read-tool call and one mutating-tool call through a
+    /// real executor + channel and asserts both reached their registered
+    /// tool: the executor saw the read call, `approval_tx` received the
+    /// mutating call's approval intent, and the reply names both tools.
+    #[tokio::test]
+    async fn run_agent_request_forwards_executor_and_approval_channel() {
+        use rig::test_utils::{MockCompletionModel, MockTurn};
+
+        #[derive(Debug)]
+        struct RecordingExec {
+            read_calls: Arc<Mutex<Vec<String>>>,
+        }
+        impl crate::tool_exec::RocmToolExecutor for RecordingExec {
+            fn execute(&self, name: &str, args: &Value) -> crate::tool_exec::RocmToolOutcome {
+                if name == "watcher_disable" {
+                    crate::tool_exec::RocmToolOutcome::ApprovalRequired(
+                        crate::tool_exec::ApprovalIntent {
+                            title: "Disable watcher".to_string(),
+                            body: vec!["watcher_disable".to_string()],
+                            name: name.to_string(),
+                            arguments: args.clone(),
+                        },
+                    )
+                } else {
+                    self.read_calls.lock().unwrap().push(name.to_string());
+                    crate::tool_exec::RocmToolOutcome::Result(json!({ "doctor": "ok" }))
+                }
+            }
+            fn execute_approved(
+                &self,
+                name: &str,
+                _args: &Value,
+            ) -> crate::tool_exec::RocmToolOutcome {
+                panic!("execute_approved must never run inside the rig tool loop (got {name})");
+            }
+        }
+
+        let read_calls = Arc::new(Mutex::new(Vec::new()));
+        let exec: SharedRocmToolExecutor = Arc::new(RecordingExec {
+            read_calls: read_calls.clone(),
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ClientMsg>();
+
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("call_0", "doctor", json!({})),
+            MockTurn::tool_call("call_1", "watcher_disable", json!({ "watcher": "w1" })),
+            MockTurn::text("done"),
+        ]);
+        let agent = rig::agent::AgentBuilder::new(model).preamble(DEFAULT_PREAMBLE);
+        let history = [ChatTurn::user("do stuff")];
+
+        let reply = run_agent_request(
+            agent,
+            &InferenceParams::default(),
+            Some(&exec),
+            Some(&tx),
+            &history,
+            fixture_snapshot(),
+            "mock-test",
+        )
+        .await
+        .expect("scripted read + mutating calls then a text turn should succeed");
+
+        assert!(
+            reply.contains("doctor") && reply.contains("watcher_disable"),
+            "reply should annotate both tools that fired: {reply}"
+        );
+        assert_eq!(
+            read_calls.lock().unwrap().as_slice(),
+            ["doctor".to_string()],
+            "the read tool must have reached the injected executor"
+        );
+
+        match rx
+            .try_recv()
+            .expect("approval intent must be posted for the mutating call")
+        {
+            ClientMsg::ChatApprovalRequired { intent } => {
+                assert_eq!(intent.name, "watcher_disable");
+                assert_eq!(intent.arguments["watcher"], "w1");
+            }
+            other => panic!("expected ChatApprovalRequired, got {other:?}"),
+        }
     }
 
     /// Captures the `backend` field off every tracing event

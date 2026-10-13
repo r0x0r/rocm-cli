@@ -593,15 +593,6 @@ async fn agent_examines_for_tooling(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
-/// The probe Phase 0 of the skill runs. The same invocation as
-/// `diagnose-34`, so the two cannot disagree about how to read the manifest.
-#[when("an agent asks the CLI which catalog contract it publishes")]
-async fn agent_reads_catalog_contract(world: &mut E2eWorld) {
-    let (stdout, _, rc) = crate::run_rocm(world, &["fix", "--json"]);
-    world.cli_output = Some(stdout);
-    world.cli_rc = Some(rc);
-}
-
 // ── Then ───────────────────────────────────────────────────────────
 
 #[then("the skill and the CLI describe the same set of remediations")]
@@ -843,10 +834,14 @@ async fn assert_known_verdict(world: &mut E2eWorld) {
 
 #[then("the contract the skill requires is one the CLI publishes")]
 async fn assert_required_contract_is_published(world: &mut E2eWorld) {
+    // The When step is `diagnose-34`'s ("a tool asks the CLI for its catalog in
+    // machine-readable form"): the probe Phase 0 runs is the one invocation, so
+    // the two scenarios cannot disagree about how to read the manifest.
     assert_eq!(
         world.cli_rc,
         Some(0),
-        "the catalog manifest is the probe Phase 0 relies on; it must exit 0"
+        "the catalog manifest is the probe Phase 0 relies on; it must exit 0. stderr: {:?}",
+        world.cli_stderr
     );
     let output = world
         .cli_output

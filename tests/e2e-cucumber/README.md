@@ -271,7 +271,9 @@ the whole reason the feature exists. So anything already proven by
 `diagnose.feature` — that a fix for another OS is declined without writing
 anything, that the listing is complete, that a report says plainly whether a
 cause was established — stays there and is **not** restated here. If a scenario
-in this feature does not read `reference.md`, it is in the wrong file.
+in this feature does not read `reference.md`, it is in the wrong file. The one
+exception is `skill-07`, which reads `SKILL.md` for the catalog contract number
+that Phase 0 requires.
 
 Reading that document as test data is a deliberate, narrow exception to
 **Black-box only** above: nothing is imported from the rocm-cli codebase — a
@@ -286,6 +288,9 @@ quietly reduce an assertion to a no-op. Free-standing prose outside those
 spots — the failure-mode count in the catalog heading, the Linux-only/
 Windows-only recap line under the table, SKILL.md's "the other N are
 print-only" — is not parsed, so it can drift without failing anything here.
+`skill-07` is the one place SKILL.md is parsed: it reads the sentence that
+declares the required catalog contract version, so rewording that sentence
+fails the scenario.
 
 Two rules follow:
 

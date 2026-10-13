@@ -49,14 +49,14 @@ the result from `--json`:
 
 Apply a fix by id (run with no id to list). `rocm fix --json` with no id prints
 the catalog manifest instead: `contract_version`, one entry per fix, and the
-exit-code map. It changes nothing and exits 0. The skill reads
+exit-code map. It applies no fix and exits 0. The skill reads
 `contract_version` before it diagnoses (Phase 0 in `SKILL.md`). `--json` with an
-id is refused with exit 1. Exit codes:
+id is refused, and the refusal exits 1 (see the table). Exit codes:
 
 | code | meaning |
 | --- | --- |
 | 0 | applied / dry-run / print-only plan / list |
-| 1 | internal error |
+| 1 | internal error; also the refusal of `--json` together with a fix id |
 | 2 | usage error (incl. unknown fix-id) |
 | 3 | not applicable on this host (OS mismatch, negative `--device-index`) — nothing changed |
 | 4 | attempted but the command failed |

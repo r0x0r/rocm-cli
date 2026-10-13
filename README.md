@@ -264,7 +264,7 @@ the JSON report, not the human-readable one.
 ```
 rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]] [--report]
 rocm diagnose --model <model> [--json]
-rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N]
+rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N] [--json]
 ```
 
 `diagnose` matches this machine against a fixed catalog of known

@@ -38,7 +38,8 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   # The distinction that earns this feature its place: those tests compare the
   # CLI against expectations written in the test suite, so they catch the CLI
   # drifting. Only these scenarios catch the DOCUMENT drifting, because only
-  # here is `reference.md` itself the expected value.
+  # here is a published document itself the expected value: `reference.md`, and
+  # for skill-07 the contract number that `SKILL.md` declares.
   #
   # Every scenario is a query: no GPU, no serve, no download, no mutation — so
   # they all run on the blocking mock lane and need no capability tags.
@@ -104,5 +105,5 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   # behavioural evals cannot reach it: their runners carry no `rocm`).
   @id:skill-required-contract-is-one-the-cli-publishes
   Scenario: skill-07 - The skill never requires a catalog contract newer than the one the CLI publishes
-    When an agent asks the CLI which catalog contract it publishes
+    When a tool asks the CLI for its catalog in machine-readable form
     Then the contract the skill requires is one the CLI publishes

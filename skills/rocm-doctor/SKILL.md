@@ -108,21 +108,28 @@ passes — the GPU is AMD. Linux, Windows and WSL2 all run the same workflow.
    rocm fix --json
    ```
 
-   It prints the catalog manifest and changes nothing. Read `contract_version`
-   from the output and ignore the rest. This skill requires `contract_version` 1
-   or higher.
-
-   If the command fails, prints no `contract_version`, or prints a lower number,
-   **stop**. Say that the installed `rocm` CLI is older than this skill requires,
-   so the CLI is the side to update. Do **not** run `rocm examine`,
-   `rocm diagnose`, or `rocm fix <id>`. Offer to update the CLI by re-running the
-   installer above, with the user's consent, then repeat this check.
+   It prints the catalog manifest as JSON and applies no fix. Read
+   `contract_version` from that JSON and ignore the rest, including any progress
+   line printed before it. This skill requires `contract_version` 1 or higher.
 
    An older CLI rejects `--json` as an unexpected argument and exits with code 2.
    In `reference.md`, exit code 2 is a usage error such as an unknown fix id; here
-   it means the CLI is too old. Against a CLI without this contract, the entry
-   ids, the auto-applicable set, and the exit codes this skill documents are
-   guesses, and a guess presented as a fact is the failure this check prevents.
+   it means the CLI is too old. If the command exits with code 2 and an
+   unexpected-argument error, or prints a lower `contract_version`, **stop**. Say
+   that the installed `rocm` CLI is older than this skill requires, so the CLI is
+   the side to update. Do **not** run `rocm examine`, `rocm diagnose`, or
+   `rocm fix <id>`. Offer to update the CLI by re-running the installer above,
+   with the user's consent, then repeat this check. If the user declines, the
+   installer cannot run, or the check still fails afterwards (an older `rocm`
+   earlier on `PATH` can cause that), hand the user the install page
+   (https://github.com/ROCm/rocm-cli) and stop.
+
+   Any other failure, such as a different exit code or output with no
+   `contract_version`, is an error from the CLI and not proof that it is old.
+   Relay the error text and stop, because reinstalling the same version would not
+   clear it. Against a CLI without this contract, the entry ids, the
+   auto-applicable set, and the exit codes this skill documents are guesses, and a
+   guess presented as a fact is the failure this check prevents.
 
 1. **Diagnose.** Pass the user's error text as the symptom:
 

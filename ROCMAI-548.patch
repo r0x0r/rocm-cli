@@ -23,37 +23,47 @@ diff --git a/apps/rocm/src/main.rs b/apps/rocm/src/main.rs
          Some(Command::Engines { command }) => engines(command),
          Some(Command::Model { verbose }) => {
              let paths = AppPaths::discover()?;
-+            let (dedicated_vram_gib, host_ram_gib) = host_memory_for_model_list();
++            let host = host_memory_for_model_list();
              let rendered = if verbose {
 -                render_model_registry_verbose_text_with_context_and_host(Some(&paths), None, None)
 +                render_model_registry_verbose_text_with_context_and_host(
 +                    Some(&paths),
-+                    dedicated_vram_gib,
-+                    host_ram_gib,
++                    host.dedicated_vram_gib,
++                    host.ram_gib,
 +                )
              } else {
 -                render_model_registry_text_with_context_and_host(Some(&paths), None, None)
-+                render_model_registry_text_with_context_and_host(
-+                    Some(&paths),
-+                    dedicated_vram_gib,
-+                    host_ram_gib,
++                render_model_registry_text_for_gfx_target(
++                    host.dedicated_vram_gib,
++                    host.ram_gib,
++                    host.gfx_target.as_deref(),
 +                )
              };
              print!("{rendered}");
              Ok(())
-@@ -3036,6 +3045,29 @@ fn examination_reports_amd_gpu(examination: &rocm_core::Examination) -> bool {
+@@ -3036,6 +3045,43 @@ fn examination_reports_amd_gpu(examination: &rocm_core::Examination) -> bool {
      }
  }
  
-+/// Memory figures used to mark which listed models fit this machine, as
-+/// `(dedicated VRAM in GiB, system RAM in GiB)`.
++/// What the model list needs to know about this machine, probed once so the
++/// renderer does not repeat a probe that can spawn a subprocess.
++struct ModelListHost {
++    /// Dedicated VRAM in GiB; `None` unless a discrete card reported it.
++    dedicated_vram_gib: Option<f64>,
++    /// Installed system RAM in GiB.
++    ram_gib: Option<f64>,
++    /// The host gfx target, used to mark the hardware group that is this GPU.
++    gfx_target: Option<String>,
++}
++
++/// Memory figures used to mark which listed models fit this machine.
 +///
 +/// VRAM is only reported for a discrete card: on an APU `amd-smi` names the BIOS
 +/// carve-out, the wrong pool (see [`classify_accelerator_memory`]), so the
 +/// model list falls back to system RAM there. The list is advisory, so
 +/// installed RAM is acceptable as an estimate; `rocm diagnose --model` stays
 +/// the authority on whether one model will actually run.
-+fn host_memory_for_model_list() -> (Option<f64>, Option<f64>) {
++fn host_memory_for_model_list() -> ModelListHost {
 +    let vram = gpu_vram_usage();
 +    let gfx_target = detect_host_gfx_target();
 +    let dedicated_vram_gib = match classify_accelerator_memory(
@@ -65,36 +75,54 @@ diff --git a/apps/rocm/src/main.rs b/apps/rocm/src/main.rs
 +        AcceleratorMemory::Dedicated(gib) => Some(gib),
 +        _ => None,
 +    };
-+    (dedicated_vram_gib, rocm_core::detect_system_ram_gib())
++    ModelListHost {
++        dedicated_vram_gib,
++        ram_gib: rocm_core::detect_system_ram_gib(),
++        gfx_target,
++    }
 +}
 +
  fn host_accelerator_memory(
      host_gpu_summary: &rocm_core::HostGpuSummary,
      examination: &rocm_core::Examination,
-@@ -13146,10 +13178,11 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
+@@ -13146,10 +13192,11 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
          [command]
              if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
          {
-+            let (dedicated_vram_gib, host_ram_gib) = host_memory_for_model_list();
++            let host = host_memory_for_model_list();
              Ok(render_model_registry_verbose_text_with_context_and_host(
                  Some(paths),
 -                None,
 -                None,
-+                dedicated_vram_gib,
-+                host_ram_gib,
++                host.dedicated_vram_gib,
++                host.ram_gib,
              ))
          }
          [command] if command.eq_ignore_ascii_case("daemon") => {
-@@ -14163,7 +14196,7 @@ fn append_examine_engine_inventory(
+@@ -14163,7 +14210,21 @@ fn append_examine_engine_inventory(
  pub(crate) fn render_model_registry_text_with_context_and_host(
      _paths: Option<&AppPaths>,
      aggregate_gpu_vram_gib: Option<f64>,
 -    _host_ram_gib: Option<f64>,
 +    host_ram_gib: Option<f64>,
++) -> String {
++    render_model_registry_text_for_gfx_target(
++        aggregate_gpu_vram_gib,
++        host_ram_gib,
++        detect_host_gfx_target().as_deref(),
++    )
++}
++
++/// The recommended-model list for a host whose gfx target is already known, so
++/// `rocm model` probes the GPU once rather than once for memory and again here.
++pub(crate) fn render_model_registry_text_for_gfx_target(
++    aggregate_gpu_vram_gib: Option<f64>,
++    host_ram_gib: Option<f64>,
++    host_gfx_target: Option<&str>,
  ) -> String {
      let mut output = String::new();
      let registry = match load_model_recipe_registry() {
-@@ -14174,6 +14207,9 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
+@@ -14174,6 +14235,9 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
          }
      };
      let _ = writeln!(output, "{}", model_catalog_header(&registry));
@@ -104,15 +132,15 @@ diff --git a/apps/rocm/src/main.rs b/apps/rocm/src/main.rs
      // Curated view: for the built-in catalog show only the featured short list;
      // a configured index is already curated, so show all of it. Group either way
      // by the hardware path each model targets.
-@@ -14184,9 +14220,40 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
+@@ -14184,19 +14248,46 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
          .filter(|recipe| show_all || model_recipe_featured(recipe))
          .collect::<Vec<_>>();
      let platforms = model_catalog_platforms(&registry);
 -    let host_gfx_family = detect_host_gfx_target()
-+    let host_gfx_target = detect_host_gfx_target();
-+    let host_gfx_family = host_gfx_target
-         .as_deref()
-         .and_then(normalize_therock_family);
+-        .as_deref()
+-        .and_then(normalize_therock_family);
+-    for platform in &platforms {
++    let host_gfx_family = host_gfx_target.and_then(normalize_therock_family);
 +    // The hardware groups below are fixed catalog classes, so on a small or
 +    // older machine they can all be too large or not match at all. Lead with the
 +    // models that do fit, whichever group they sit in.
@@ -143,10 +171,25 @@ diff --git a/apps/rocm/src/main.rs b/apps/rocm/src/main.rs
 +        }
 +    }
 +    let mut any_group_matches_host = false;
-     for platform in &platforms {
++    for (platform_index, platform) in platforms.iter().enumerate() {
++        // Several platforms can run the same engine (Strix Halo and Radeon both
++        // serve GGUF through Lemonade), so list each model under one group only:
++        // the group that is this host's GPU when there is one, else the first.
          let mut group = visible
              .iter()
-@@ -14205,6 +14272,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
+             .filter(|recipe| {
+-                recipe.preferred_engines.first().is_some_and(|engine| {
+-                    platform
+-                        .engines
+-                        .iter()
+-                        .any(|e| e.eq_ignore_ascii_case(engine))
+-                })
++                model_recipe_platform_index(recipe, &platforms, host_gfx_family.as_deref())
++                    == Some(platform_index)
+             })
+             .peekable();
+         if group.peek().is_none() {
+@@ -14205,6 +14296,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
          let your_gpu = host_gfx_family
              .as_deref()
              .is_some_and(|family| platform_matches_gfx_family(platform, family));
@@ -154,7 +197,9 @@ diff --git a/apps/rocm/src/main.rs b/apps/rocm/src/main.rs
          let heading = if your_gpu {
              format!("{} \u{2190} your GPU", platform.label)
          } else {
-@@ -14216,21 +14284,22 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
+@@ -14214,23 +14306,24 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
+         for recipe in group {
+             // Show the canonical Hugging Face id (the reliable serve target) and
              // the quant that fits this hardware. Append a fit verdict only when the
 -            // host GPU VRAM is known — otherwise every row would read "GPU fit
 -            // unknown", which is noise.
@@ -178,7 +223,7 @@ diff --git a/apps/rocm/src/main.rs b/apps/rocm/src/main.rs
              let _ = writeln!(output, "  {}  {}{}", recipe.canonical_model_id, detail, fit);
          }
      }
-+    if let Some(target) = host_gfx_target.as_deref()
++    if let Some(target) = host_gfx_target
 +        && !any_group_matches_host
 +    {
 +        let _ = writeln!(
@@ -191,10 +236,44 @@ diff --git a/apps/rocm/src/main.rs b/apps/rocm/src/main.rs
      if matches!(registry.source, ModelRecipeRegistrySource::BuiltIn) {
          let _ = writeln!(
              output,
-@@ -14245,6 +14314,57 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
+@@ -14245,6 +14338,91 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
      output
  }
  
++/// Whether the platform's engines include the recipe's preferred engine.
++fn platform_serves_recipe(
++    platform: &rocm_core::ModelCatalogPlatform,
++    recipe: &ModelRecipeRecord,
++) -> bool {
++    recipe.preferred_engines.first().is_some_and(|engine| {
++        platform
++            .engines
++            .iter()
++            .any(|e| e.eq_ignore_ascii_case(engine))
++    })
++}
++
++/// The one platform group a recipe is listed under.
++///
++/// A platform that matches the host's GPU wins, so a model is never filed under
++/// another hardware class while this machine's own class is on the page.
++/// Otherwise the first platform that serves the recipe's engine.
++fn model_recipe_platform_index(
++    recipe: &ModelRecipeRecord,
++    platforms: &[rocm_core::ModelCatalogPlatform],
++    host_gfx_family: Option<&str>,
++) -> Option<usize> {
++    let serves =
++        |platform: &rocm_core::ModelCatalogPlatform| platform_serves_recipe(platform, recipe);
++    host_gfx_family
++        .and_then(|family| {
++            platforms.iter().position(|platform| {
++                serves(platform) && platform_matches_gfx_family(platform, family)
++            })
++        })
++        .or_else(|| platforms.iter().position(serves))
++}
++
 +/// The quant or memory note shown beside a model in the list.
 +fn model_recipe_detail(recipe: &ModelRecipeRecord) -> String {
 +    recipe
@@ -249,7 +328,7 @@ diff --git a/apps/rocm/src/main.rs b/apps/rocm/src/main.rs
  fn model_recipe_memory_label(recipe: &ModelRecipeRecord) -> String {
      recipe.min_gpu_mem_gb.map_or_else(
          || "no GPU minimum".to_owned(),
-@@ -34747,10 +34867,15 @@ install therock";
+@@ -34747,10 +34925,15 @@ install therock";
          assert!(!rendered.contains("DeepSeek-V4-Flash"));
          // Without a known host GPU, no misleading per-row fit verdict is shown.
          assert!(!rendered.contains("GPU fit unknown"));
@@ -267,7 +346,7 @@ diff --git a/apps/rocm/src/main.rs b/apps/rocm/src/main.rs
          // Disclaimer: the list is a starting point; any compatible HF model works.
          assert!(rendered.contains("you can serve any compatible Hugging Face model"));
          assert!(rendered.contains("rocm serve <owner/repo>:<quant>"));
-@@ -34771,6 +34896,53 @@ install therock";
+@@ -34771,6 +34954,134 @@ install therock";
          assert!(!rendered.contains("GPU fit unknown"));
      }
  
@@ -284,7 +363,7 @@ diff --git a/apps/rocm/src/main.rs b/apps/rocm/src/main.rs
 +    fn render_model_registry_text_offers_small_models_on_a_16_gib_host() {
 +        // ROCMAI-548: a 16 GiB integrated-GPU host used to see only 17-62 GiB
 +        // models. Without dedicated VRAM, system RAM is the budget.
-+        let rendered = render_model_registry_text_with_context_and_host(None, None, Some(16.0));
++        let rendered = render_model_registry_text_for_gfx_target(None, Some(16.0), None);
 +
 +        assert!(rendered.contains("This machine: 16 GiB system memory"));
 +        let fits = fits_this_machine_block(&rendered);
@@ -299,7 +378,7 @@ diff --git a/apps/rocm/src/main.rs b/apps/rocm/src/main.rs
 +
 +    #[test]
 +    fn render_model_registry_text_says_when_nothing_fits() {
-+        let rendered = render_model_registry_text_with_context_and_host(None, None, Some(2.0));
++        let rendered = render_model_registry_text_for_gfx_target(None, Some(2.0), None);
 +
 +        assert!(rendered.contains("No recommended model fits this machine's memory"));
 +        assert!(!rendered.contains("Fits this machine:"));
@@ -309,13 +388,94 @@ diff --git a/apps/rocm/src/main.rs b/apps/rocm/src/main.rs
 +    fn render_model_registry_text_prefers_dedicated_vram_over_system_ram() {
 +        // A discrete card with 8 GiB VRAM does not fit a 22 GiB model even when the
 +        // host has 64 GiB of RAM.
-+        let rendered =
-+            render_model_registry_text_with_context_and_host(None, Some(8.0), Some(64.0));
++        let rendered = render_model_registry_text_for_gfx_target(Some(8.0), Some(64.0), None);
 +
 +        let fits = fits_this_machine_block(&rendered);
 +        assert!(fits.contains("Qwen3-4B-Instruct-2507-GGUF"), "{fits}");
 +        assert!(!fits.contains("Qwen3.6-35B-A3B"), "{fits}");
 +        assert!(rendered.contains("needs a larger GPU"));
++    }
++
++    /// Lines of the list that start with `model_id`: its row in the fits block
++    /// and its row in a hardware group, not the example in the footer.
++    fn model_rows<'a>(rendered: &'a str, model_id: &str) -> Vec<&'a str> {
++        rendered
++            .lines()
++            .filter(|line| line.trim_start().starts_with(model_id))
++            .collect()
++    }
++
++    #[test]
++    fn render_model_registry_text_lists_each_model_under_one_hardware_group() {
++        // Strix Halo and Radeon both serve GGUF through Lemonade, so a Lemonade
++        // model used to be printed under both headings. With no GPU to match it
++        // is listed once, in the first group; the fits block is a separate summary.
++        let rendered = render_model_registry_text_for_gfx_target(None, Some(16.0), None);
++
++        let small = model_rows(&rendered, "Qwen3-4B-Instruct-2507-GGUF");
++        assert_eq!(small.len(), 2, "fits block + one group: {small:?}\n{rendered}");
++        let large = model_rows(&rendered, "unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M");
++        assert_eq!(large.len(), 1, "one group only: {large:?}\n{rendered}");
++        assert!(rendered.contains("Strix Halo"));
++        assert!(!rendered.contains("RX 7000/9000"));
++    }
++
++    #[test]
++    fn render_model_registry_text_files_models_under_the_hosts_own_group() {
++        // A Radeon RX 9000 host gets its models under the Radeon heading, marked
++        // as its GPU; the Strix Halo heading is not printed for it.
++        let radeon = render_model_registry_text_for_gfx_target(None, Some(16.0), Some("gfx1201"));
++        assert!(
++            radeon.contains("RX 7000/9000, Radeon PRO (Lemonade / llama.cpp) \u{2190} your GPU")
++        );
++        assert!(!radeon.contains("Strix Halo"), "{radeon}");
++        assert_eq!(
++            model_rows(&radeon, "unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M").len(),
++            1,
++            "{radeon}"
++        );
++        assert!(!radeon.contains("None of the groups above"), "{radeon}");
++
++        let strix = render_model_registry_text_for_gfx_target(None, Some(16.0), Some("gfx1151"));
++        assert!(strix.contains("Strix Halo (Lemonade / llama.cpp) \u{2190} your GPU"));
++        assert!(!strix.contains("RX 7000/9000"), "{strix}");
++        assert!(!strix.contains("None of the groups above"), "{strix}");
++    }
++
++    #[test]
++    fn render_model_registry_text_notes_when_no_group_is_the_hosts_gpu() {
++        // ROCMAI-548: Vega 7 (gfx90c) matches no catalog hardware class. The list
++        // says so, and still offers what fits by memory.
++        let rendered = render_model_registry_text_for_gfx_target(None, Some(16.0), Some("gfx90c"));
++
++        assert!(
++            rendered.contains("None of the groups above is specific to this GPU (gfx90c)"),
++            "{rendered}"
++        );
++        assert!(!rendered.contains("\u{2190} your GPU"));
++        assert!(fits_this_machine_block(&rendered).contains("Qwen3-4B-Instruct-2507-GGUF"));
++    }
++
++    #[test]
++    fn model_list_remediation_commands_are_accepted_by_the_cli() {
++        // The list tells the user to run these. The command each names must parse
++        // with the flags shown; that `rocm diagnose --model` then recognises a model
++        // the list offers is proved end to end by scenario `model-list-03`.
++        let rendered = render_model_registry_text_for_gfx_target(None, Some(16.0), Some("gfx90c"));
++        assert!(rendered.contains("`rocm diagnose --model <model>`"));
++        assert!(rendered.contains("rocm serve <owner/repo>"));
++        let nothing_fits = render_model_registry_text_for_gfx_target(None, Some(2.0), None);
++        assert!(nothing_fits.contains("`rocm serve <owner/repo>`"));
++
++        for args in [
++            ["rocm", "diagnose", "--model", "qwen"].as_slice(),
++            ["rocm", "serve", "Qwen/Qwen3-0.6B"].as_slice(),
++        ] {
++            assert!(
++                Cli::try_parse_from(args).is_ok(),
++                "the list names a command the CLI rejects: {args:?}"
++            );
++        }
 +    }
 +
      #[test]
@@ -370,3 +530,340 @@ diff --git a/crates/rocm-core/src/model_catalog.json b/crates/rocm-core/src/mode
        "chat_template_mode": "lemonade",
        "preferred_engines": [
          "lemonade"
+diff --git a/tests/e2e-cucumber/features/model_list.feature b/tests/e2e-cucumber/features/model_list.feature
+new file mode 100644
+--- /dev/null
++++ b/tests/e2e-cucumber/features/model_list.feature
+@@ -0,0 +1,42 @@
++Feature: The recommended model list fits the machine it is shown on
++
++  # ROCMAI-548: on a 16 GiB machine with an integrated GPU the list offered only
++  # models of 17-62 GiB and nothing a user could run. These scenarios hold the list
++  # to the machine's memory: it says what it measured, leads with what fits, and
++  # marks what does not.
++  #
++  # The machine is simulated, so the answer does not depend on the runner. With no
++  # dedicated GPU memory to read, system memory is the budget, which is why these
++  # run only on a host with no AMD GPU (@requires-no-gpu): on a GPU lane the real
++  # card's memory takes precedence over the memory planted here and the answer
++  # would differ per runner. System memory is read from /proc/meminfo on Linux
++  # only, hence @requires-os:linux. The planted memory is honoured only by a
++  # `rocm` built with the `e2e-test-hooks` feature (what `cargo xtask e2e`
++  # builds); the steps say so when the reported memory is not the planted figure.
++
++  @id:model-list-small-machine-is-offered-a-small-model @requires-os:linux @requires-no-gpu
++  Scenario: model-list-01 - A 16 GiB machine is offered a small model
++    Given a machine with 16 GiB of memory
++    When the user lists the recommended models
++    Then the list reports 16 GiB of system memory
++    And the small model is listed as fitting this machine
++    And the models too large for this machine are not listed as fitting
++    And the models too large for this machine are marked as needing more memory
++
++  @id:model-list-machine-too-small-for-any-recommendation @requires-os:linux @requires-no-gpu
++  Scenario: model-list-02 - A machine too small for any recommendation is told so
++    Given a machine with 2 GiB of memory
++    When the user lists the recommended models
++    Then the list reports 2 GiB of system memory
++    And the user is told no recommended model fits this machine
++    And no model is listed as fitting this machine
++    And every recommended model is marked as needing more memory
++
++  # The list points the user at `rocm diagnose --model` for a definite answer, so
++  # the model it leads with has to be one that command knows by that name.
++  @id:model-list-fitting-model-is-accepted-by-diagnose @requires-os:linux @requires-no-gpu
++  Scenario: model-list-03 - The model the list recommends is one the CLI can check
++    Given a machine with 16 GiB of memory
++    When the user lists the recommended models
++    And the user asks whether the first model offered as fitting would run
++    Then the CLI recognises that model as one of its recommendations
+diff --git a/tests/e2e-cucumber/tests/e2e.rs b/tests/e2e-cucumber/tests/e2e.rs
+--- a/tests/e2e-cucumber/tests/e2e.rs
++++ b/tests/e2e-cucumber/tests/e2e.rs
+@@ -33,6 +33,7 @@ mod e2e {
+     pub mod examine_steps;
+     pub mod lifecycle_steps;
+     pub mod logs_steps;
++    pub mod model_list_steps;
+     pub mod remote_steps;
+     pub mod runtime_lifecycle_steps;
+     pub mod runtime_steps;
+diff --git a/tests/e2e-cucumber/tests/e2e/model_list_steps.rs b/tests/e2e-cucumber/tests/e2e/model_list_steps.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/e2e-cucumber/tests/e2e/model_list_steps.rs
+@@ -0,0 +1,263 @@
++// Copyright © Advanced Micro Devices, Inc., or its affiliates.
++//
++// SPDX-License-Identifier: MIT
++
++//! Steps for `model_list.feature`.
++//!
++//! The machine's memory is simulated by planting a `/proc/meminfo` under a
++//! directory the scenario owns and pointing the CLI's hardware probes at it. That
++//! redirection exists only in a `rocm` built with the `e2e-test-hooks` feature,
++//! which is what `cargo xtask e2e` builds. The scenarios are gated to hosts with
++//! no AMD GPU, where system memory is the whole budget, so nothing else the CLI
++//! measures can change the answer.
++
++use cucumber::{given, then, when};
++
++use crate::E2eWorld;
++
++/// The environment variable that re-roots the CLI's hardware probes in a build
++/// with the `e2e-test-hooks` feature. Black-box: named here, not imported.
++const HOST_ROOT_ENV: &str = "ROCM_CLI_TEST_HOST_ROOT";
++
++/// Heading of the block that leads the list with the models that fit.
++const FITS_HEADING: &str = "Fits this machine:";
++/// Line printed instead of that block when nothing fits.
++const NOTHING_FITS_LINE: &str = "No recommended model fits this machine's memory";
++/// Suffix of a row in the hardware groups whose model fits.
++const ROW_FITS: &str = "fits this machine's memory";
++/// Suffix of a row in the hardware groups whose model does not.
++const ROW_TOO_LARGE: &str = "needs more memory than this machine has";
++
++/// The one featured model small enough for a 16 GiB machine.
++const SMALL_MODEL: &str = "Qwen3-4B-Instruct-2507-GGUF";
++/// Featured models that need more than 16 GiB.
++const TOO_LARGE_MODELS: [&str; 2] = ["Qwen3.6-35B-A3B", "gemma-4-26B-A4B"];
++
++/// Said when the planted memory did not reach the CLI, so a binary built without
++/// the hook is named as the cause instead of reading as a wrong model list.
++const HOOK_HINT: &str = "If this line is missing or shows this runner's real memory, the `rocm` \
++     under test was built without the `rocm/e2e-test-hooks` feature, which is what lets the \
++     suite plant a simulated machine. `cargo xtask e2e` builds it that way; a prebuilt \
++     ROCM_CLI_BINARY must too.";
++
++// ── Given ──────────────────────────────────────────────────────────
++
++#[given(expr = "a machine with {int} GiB of memory")]
++async fn machine_with_memory(world: &mut E2eWorld, gib: u64) {
++    let host = world
++        .isolated_root
++        .as_ref()
++        .expect("no isolated root")
++        .path()
++        .join("host");
++    let proc_dir = host.join("proc");
++    std::fs::create_dir_all(&proc_dir).expect("failed to create simulated /proc");
++    // `/proc/meminfo` reports MemTotal in kB (KiB).
++    std::fs::write(
++        proc_dir.join("meminfo"),
++        format!("MemTotal:       {} kB\n", gib * 1024 * 1024),
++    )
++    .expect("failed to write simulated /proc/meminfo");
++    world
++        .command_env
++        .push((HOST_ROOT_ENV, host.into_os_string()));
++}
++
++// ── When ───────────────────────────────────────────────────────────
++
++#[when("the user lists the recommended models")]
++async fn user_lists_models(world: &mut E2eWorld) {
++    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["model"]);
++    world.cli_output = Some(stdout);
++    world.cli_stderr = Some(stderr);
++    world.cli_rc = Some(rc);
++}
++
++/// Asks the CLI the question the list points to for the first model it offers.
++/// Replaces the recorded list with the answer; the model asked about is kept in
++/// `model_name`.
++#[when("the user asks whether the first model offered as fitting would run")]
++async fn user_asks_about_first_fitting_model(world: &mut E2eWorld) {
++    let model = {
++        let out = listing(world);
++        let fits = fits_block(out)
++            .unwrap_or_else(|| panic!("the list has no `{FITS_HEADING}` block:\n{out}"));
++        fits.first()
++            .copied()
++            .and_then(|row| row.split_whitespace().next())
++            .unwrap_or_else(|| panic!("the `{FITS_HEADING}` block lists no model:\n{out}"))
++            .to_owned()
++    };
++    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--model", &model, "--json"]);
++    world.model_name = Some(model);
++    world.cli_output = Some(stdout);
++    world.cli_stderr = Some(stderr);
++    world.cli_rc = Some(rc);
++}
++
++// ── Then ───────────────────────────────────────────────────────────
++
++#[then(expr = "the list reports {int} GiB of system memory")]
++async fn list_reports_memory(world: &mut E2eWorld, gib: u64) {
++    let out = listing(world);
++    let expected = format!("This machine: {gib} GiB system memory");
++    assert!(
++        out.lines().any(|line| line.trim() == expected),
++        "expected the line `{expected}` in the list. {HOOK_HINT}\n{out}"
++    );
++}
++
++#[then("the small model is listed as fitting this machine")]
++async fn small_model_fits(world: &mut E2eWorld) {
++    let out = listing(world);
++    assert!(
++        !out.contains(NOTHING_FITS_LINE),
++        "the list says nothing fits, yet a small model should:\n{out}"
++    );
++    let fits = fits_block(out)
++        .unwrap_or_else(|| panic!("the list has no `{FITS_HEADING}` block:\n{out}"));
++    assert!(
++        fits.iter().any(|row| row.trim_start().starts_with(SMALL_MODEL)),
++        "{SMALL_MODEL} is not in the `{FITS_HEADING}` block: {fits:?}\n{out}"
++    );
++    // The same verdict has to appear where the model sits among its hardware
++    // group, or the two parts of the list disagree.
++    assert!(
++        rows_ending_with(out, ROW_FITS)
++            .iter()
++            .any(|row| row.contains(SMALL_MODEL)),
++        "{SMALL_MODEL} is not marked `{ROW_FITS}` in its hardware group:\n{out}"
++    );
++}
++
++#[then("the models too large for this machine are not listed as fitting")]
++async fn large_models_do_not_fit(world: &mut E2eWorld) {
++    let out = listing(world);
++    let fits = fits_block(out).unwrap_or_default();
++    let marked_fitting = rows_ending_with(out, ROW_FITS);
++    for model in TOO_LARGE_MODELS {
++        assert!(
++            !fits.iter().any(|row| row.contains(model)),
++            "{model} needs more than this machine has but is in the `{FITS_HEADING}` block: \
++             {fits:?}\n{out}"
++        );
++        assert!(
++            !marked_fitting.iter().any(|row| row.contains(model)),
++            "{model} needs more than this machine has but is marked `{ROW_FITS}`:\n{out}"
++        );
++    }
++}
++
++#[then("the models too large for this machine are marked as needing more memory")]
++async fn large_models_are_marked(world: &mut E2eWorld) {
++    let out = listing(world);
++    let marked = rows_ending_with(out, ROW_TOO_LARGE);
++    for model in TOO_LARGE_MODELS {
++        assert!(
++            marked.iter().any(|row| row.contains(model)),
++            "{model} is not marked `{ROW_TOO_LARGE}`:\n{out}"
++        );
++    }
++}
++
++#[then("the user is told no recommended model fits this machine")]
++async fn told_nothing_fits(world: &mut E2eWorld) {
++    let out = listing(world);
++    assert!(
++        out.lines().any(|line| line.starts_with(NOTHING_FITS_LINE)),
++        "expected a line starting `{NOTHING_FITS_LINE}`:\n{out}"
++    );
++}
++
++#[then("no model is listed as fitting this machine")]
++async fn no_model_fits(world: &mut E2eWorld) {
++    let out = listing(world);
++    assert!(
++        fits_block(out).is_none(),
++        "the list has a `{FITS_HEADING}` block though nothing should fit:\n{out}"
++    );
++    let marked_fitting = rows_ending_with(out, ROW_FITS);
++    assert!(
++        marked_fitting.is_empty(),
++        "rows are marked `{ROW_FITS}` though nothing should fit: {marked_fitting:?}\n{out}"
++    );
++}
++
++#[then("every recommended model is marked as needing more memory")]
++async fn every_model_is_marked(world: &mut E2eWorld) {
++    let out = listing(world);
++    // Guard against a vacuous pass: with no marks at all, "none fits" would hold
++    // for a list that simply never judged any model.
++    assert!(
++        !rows_ending_with(out, ROW_TOO_LARGE).is_empty(),
++        "no model is marked `{ROW_TOO_LARGE}`:\n{out}"
++    );
++}
++
++#[then("the CLI recognises that model as one of its recommendations")]
++async fn cli_recognises_model(world: &mut E2eWorld) {
++    let model = world.model_name.clone().expect("no model was asked about");
++    let stdout = world.cli_output.clone().unwrap_or_default();
++    let stderr = world.cli_stderr.clone().unwrap_or_default();
++    assert_eq!(
++        world.cli_rc,
++        Some(0),
++        "`rocm diagnose --model {model}` failed (it is a query and should exit 0):\n{stdout}\n{stderr}"
++    );
++    assert!(
++        !stderr.contains("unexpected argument") && !stderr.contains("Usage:"),
++        "`rocm diagnose --model {model}` was rejected as a malformed command:\n{stderr}"
++    );
++    let report: serde_json::Value = serde_json::from_str(&stdout)
++        .unwrap_or_else(|error| panic!("diagnose --json did not emit JSON ({error}):\n{stdout}"));
++    let section = report
++        .get("model")
++        .filter(|value| !value.is_null())
++        .unwrap_or_else(|| panic!("diagnose --model emitted no model section:\n{stdout}"));
++    assert_eq!(
++        section
++            .get("canonical_model_id")
++            .and_then(serde_json::Value::as_str),
++        Some(model.as_str()),
++        "the CLI did not match `{model}` to a recommendation: {section:#}"
++    );
++    assert_ne!(
++        section
++            .get("undetermined_reason")
++            .and_then(serde_json::Value::as_str),
++        Some("model_not_curated"),
++        "the CLI calls `{model}` a model it has no recommendation for: {section:#}"
++    );
++}
++
++// ── Helpers ────────────────────────────────────────────────────────
++
++/// The stdout of the recorded `rocm model`, after checking it succeeded.
++fn listing(world: &E2eWorld) -> &str {
++    let rc = world.cli_rc.expect("no command rc recorded");
++    let out = world.cli_output.as_deref().unwrap_or("");
++    assert_eq!(
++        rc,
++        0,
++        "`rocm model` failed (rc={rc}):\n{out}\n{}",
++        world.cli_stderr.as_deref().unwrap_or("")
++    );
++    out
++}
++
++/// The rows under the `Fits this machine:` heading, which end at the first blank
++/// line. `None` when the list has no such heading.
++fn fits_block(out: &str) -> Option<Vec<&str>> {
++    let mut lines = out.lines().skip_while(|line| line.trim() != FITS_HEADING);
++    lines.next()?;
++    Some(lines.take_while(|line| !line.trim().is_empty()).collect())
++}
++
++/// The list's lines whose last words are `label`: the per-model verdicts in the
++/// hardware groups. Matching the end of the line keeps the "nothing fits" notice
++/// and the usage examples at the foot of the list out of the result.
++fn rows_ending_with<'a>(out: &'a str, label: &str) -> Vec<&'a str> {
++    out.lines()
++        .filter(|line| line.trim_end().ends_with(label))
++        .collect()
++}
+diff --git a/tests/e2e-cucumber/tests/feature_naming.rs b/tests/e2e-cucumber/tests/feature_naming.rs
+--- a/tests/e2e-cucumber/tests/feature_naming.rs
++++ b/tests/e2e-cucumber/tests/feature_naming.rs
+@@ -40,6 +40,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
+     // about the ones a managed `rocm serve` leaves behind.
+     ("local_server_records.feature", "server-records"),
+     ("logs.feature", "logs"),
++    ("model_list.feature", "model-list"),
+     ("model_serving.feature", "serve"),
+     ("networking.feature", "networking"),
+     ("remote.feature", "remote"),

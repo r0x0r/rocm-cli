@@ -6514,10 +6514,23 @@ mod tests {
     }
 
     #[test]
+    fn featured_catalog_offers_a_model_for_16_gib_hosts() {
+        // ROCMAI-548: the curated list must not be only models too large for a
+        // small machine.
+        assert!(
+            builtin_model_recipes().iter().any(|recipe| {
+                model_recipe_featured(recipe)
+                    && recipe.recommended_system_ram_gb.is_some_and(|gib| gib <= 16)
+            }),
+            "no featured recipe fits a 16 GiB host"
+        );
+    }
+
+    #[test]
     fn featured_catalog_is_curated_but_hidden_stay_resolvable() {
         // Current popular models are featured in the curated list — GGUF for
         // Strix Halo (served by their owner/repo:variant id) and BF16 for MI300X.
-        for alias in ["qwen3.6", "gemma-4", "qwen3.6-27b", "gemma-4-31b"] {
+        for alias in ["qwen3.6", "gemma-4", "qwen3.6-27b", "gemma-4-31b", "qwen"] {
             let recipe = resolve_builtin_model_recipe(alias).unwrap_or_else(|| panic!("{alias}"));
             assert!(model_recipe_featured(&recipe), "{alias} should be featured");
         }
@@ -6531,7 +6544,7 @@ mod tests {
         );
         // ...while the default assistant, smoke paths, and superseded models stay
         // resolvable for `rocm serve` but are hidden from the curated list.
-        for alias in ["qwen", "tiny-gpt2", "qwen3.5", "glm-5"] {
+        for alias in ["qwen-smoke", "tiny-gpt2", "qwen3.5", "glm-5"] {
             let recipe = resolve_builtin_model_recipe(alias).unwrap_or_else(|| panic!("{alias}"));
             assert!(!model_recipe_featured(&recipe), "{alias} should be hidden");
         }

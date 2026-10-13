@@ -142,7 +142,6 @@
         "qwen-tiny",
         "llama-3.2-3b-instruct"
       ],
-      "featured": true,
       "chat_template_mode": "lemonade",
       "preferred_engines": [
         "lemonade"

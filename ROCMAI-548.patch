@@ -1,0 +1,372 @@
+diff --git a/apps/rocm/src/main.rs b/apps/rocm/src/main.rs
+--- a/apps/rocm/src/main.rs
++++ b/apps/rocm/src/main.rs
+@@ -124,7 +124,7 @@ to check that your GPU and ROCm install are ready, then `rocm serve <model>` to
+ rocm examine                      Check GPU, ROCm install, and engines\n  \
+ rocm install sdk                  Install ROCm wheels into a managed environment\n  \
+ rocm engines list                 Show the local inference engines available\n  \
+-rocm model                        List models this machine can run\n  \
++rocm model                        List recommended models and which fit here\n  \
+ rocm serve qwen                   Start a local OpenAI-compatible server\n  \
+ rocm services list                Show running model servers\n\n\
+ Commands marked [preview] work but are outside the Tech Preview's supported\n\
+@@ -416,7 +416,7 @@ rocm update --json")]
+         #[command(subcommand)]
+         command: EnginesCommand,
+     },
+-    /// Show recommended local models and what this machine can run.
++    /// Show recommended local models, marked by whether they fit this machine's memory.
+     #[command(
+         alias = "models",
+         after_help = "EXAMPLES:\n  \
+@@ -2454,10 +2454,19 @@ fn dispatch(cli: Cli) -> Result<()> {
+         Some(Command::Engines { command }) => engines(command),
+         Some(Command::Model { verbose }) => {
+             let paths = AppPaths::discover()?;
++            let (dedicated_vram_gib, host_ram_gib) = host_memory_for_model_list();
+             let rendered = if verbose {
+-                render_model_registry_verbose_text_with_context_and_host(Some(&paths), None, None)
++                render_model_registry_verbose_text_with_context_and_host(
++                    Some(&paths),
++                    dedicated_vram_gib,
++                    host_ram_gib,
++                )
+             } else {
+-                render_model_registry_text_with_context_and_host(Some(&paths), None, None)
++                render_model_registry_text_with_context_and_host(
++                    Some(&paths),
++                    dedicated_vram_gib,
++                    host_ram_gib,
++                )
+             };
+             print!("{rendered}");
+             Ok(())
+@@ -3036,6 +3045,29 @@ fn examination_reports_amd_gpu(examination: &rocm_core::Examination) -> bool {
+     }
+ }
+ 
++/// Memory figures used to mark which listed models fit this machine, as
++/// `(dedicated VRAM in GiB, system RAM in GiB)`.
++///
++/// VRAM is only reported for a discrete card: on an APU `amd-smi` names the BIOS
++/// carve-out, the wrong pool (see [`classify_accelerator_memory`]), so the
++/// model list falls back to system RAM there. The list is advisory, so
++/// installed RAM is acceptable as an estimate; `rocm diagnose --model` stays
++/// the authority on whether one model will actually run.
++fn host_memory_for_model_list() -> (Option<f64>, Option<f64>) {
++    let vram = gpu_vram_usage();
++    let gfx_target = detect_host_gfx_target();
++    let dedicated_vram_gib = match classify_accelerator_memory(
++        vram.as_deref(),
++        gfx_target.as_deref(),
++        true,
++        rocm_core::usable_amd_gpu_indices().as_deref(),
++    ) {
++        AcceleratorMemory::Dedicated(gib) => Some(gib),
++        _ => None,
++    };
++    (dedicated_vram_gib, rocm_core::detect_system_ram_gib())
++}
++
+ fn host_accelerator_memory(
+     host_gpu_summary: &rocm_core::HostGpuSummary,
+     examination: &rocm_core::Examination,
+@@ -13146,10 +13178,11 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
+         [command]
+             if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
+         {
++            let (dedicated_vram_gib, host_ram_gib) = host_memory_for_model_list();
+             Ok(render_model_registry_verbose_text_with_context_and_host(
+                 Some(paths),
+-                None,
+-                None,
++                dedicated_vram_gib,
++                host_ram_gib,
+             ))
+         }
+         [command] if command.eq_ignore_ascii_case("daemon") => {
+@@ -14163,7 +14196,7 @@ fn append_examine_engine_inventory(
+ pub(crate) fn render_model_registry_text_with_context_and_host(
+     _paths: Option<&AppPaths>,
+     aggregate_gpu_vram_gib: Option<f64>,
+-    _host_ram_gib: Option<f64>,
++    host_ram_gib: Option<f64>,
+ ) -> String {
+     let mut output = String::new();
+     let registry = match load_model_recipe_registry() {
+@@ -14174,6 +14207,9 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
+         }
+     };
+     let _ = writeln!(output, "{}", model_catalog_header(&registry));
++    if let Some(ram) = host_ram_gib {
++        let _ = writeln!(output, "This machine: {ram:.0} GiB system memory");
++    }
+     // Curated view: for the built-in catalog show only the featured short list;
+     // a configured index is already curated, so show all of it. Group either way
+     // by the hardware path each model targets.
+@@ -14184,9 +14220,40 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
+         .filter(|recipe| show_all || model_recipe_featured(recipe))
+         .collect::<Vec<_>>();
+     let platforms = model_catalog_platforms(&registry);
+-    let host_gfx_family = detect_host_gfx_target()
++    let host_gfx_target = detect_host_gfx_target();
++    let host_gfx_family = host_gfx_target
+         .as_deref()
+         .and_then(normalize_therock_family);
++    // The hardware groups below are fixed catalog classes, so on a small or
++    // older machine they can all be too large or not match at all. Lead with the
++    // models that do fit, whichever group they sit in.
++    if aggregate_gpu_vram_gib.is_some() || host_ram_gib.is_some() {
++        let fitting = visible
++            .iter()
++            .copied()
++            .filter(|recipe| {
++                model_recipe_fits_host(recipe, aggregate_gpu_vram_gib, host_ram_gib) == Some(true)
++            })
++            .collect::<Vec<_>>();
++        if fitting.is_empty() {
++            let _ = writeln!(
++                output,
++                "\nNo recommended model fits this machine's memory. `rocm serve <owner/repo>` \
++                 accepts any smaller model."
++            );
++        } else {
++            let _ = writeln!(output, "\nFits this machine:");
++            for recipe in fitting {
++                let _ = writeln!(
++                    output,
++                    "  {}  {}",
++                    recipe.canonical_model_id,
++                    model_recipe_detail(recipe)
++                );
++            }
++        }
++    }
++    let mut any_group_matches_host = false;
+     for platform in &platforms {
+         let mut group = visible
+             .iter()
+@@ -14205,6 +14272,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
+         let your_gpu = host_gfx_family
+             .as_deref()
+             .is_some_and(|family| platform_matches_gfx_family(platform, family));
++        any_group_matches_host |= your_gpu;
+         let heading = if your_gpu {
+             format!("{} \u{2190} your GPU", platform.label)
+         } else {
+@@ -14216,21 +14284,22 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
+             // the quant that fits this hardware. Append a fit verdict only when the
+-            // host GPU VRAM is known — otherwise every row would read "GPU fit
+-            // unknown", which is noise.
+-            let detail = recipe
+-                .quantization
+-                .clone()
+-                .unwrap_or_else(|| model_recipe_memory_label(recipe));
+-            let fit = if aggregate_gpu_vram_gib.is_some() {
+-                format!(
+-                    "  {}",
+-                    model_recipe_gpu_fit_label(recipe, aggregate_gpu_vram_gib)
+-                )
+-            } else {
+-                String::new()
+-            };
++            // host memory is known — otherwise every row would read "fit unknown",
++            // which is noise.
++            let detail = model_recipe_detail(recipe);
++            let fit = model_recipe_host_fit_label(recipe, aggregate_gpu_vram_gib, host_ram_gib)
++                .map_or_else(String::new, |label| format!("  {label}"));
+             let _ = writeln!(output, "  {}  {}{}", recipe.canonical_model_id, detail, fit);
+         }
+     }
++    if let Some(target) = host_gfx_target.as_deref()
++        && !any_group_matches_host
++    {
++        let _ = writeln!(
++            output,
++            "\nNone of the groups above is specific to this GPU ({target}); they are hardware \
++             classes, so models are marked by memory only. `rocm diagnose --model <model>` \
++             checks whether one will run here."
++        );
++    }
+     if matches!(registry.source, ModelRecipeRegistrySource::BuiltIn) {
+         let _ = writeln!(
+             output,
+@@ -14245,6 +14314,57 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
+     output
+ }
+ 
++/// The quant or memory note shown beside a model in the list.
++fn model_recipe_detail(recipe: &ModelRecipeRecord) -> String {
++    recipe
++        .quantization
++        .clone()
++        .unwrap_or_else(|| model_recipe_memory_label(recipe))
++}
++
++/// Whether a recipe fits the host's memory, or `None` when that cannot be told.
++///
++/// Dedicated VRAM, when known, is the budget. Otherwise (an APU, or a host
++/// where VRAM could not be read) system RAM is, since an integrated GPU draws
++/// its memory from it.
++fn model_recipe_fits_host(
++    recipe: &ModelRecipeRecord,
++    dedicated_vram_gib: Option<f64>,
++    host_ram_gib: Option<f64>,
++) -> Option<bool> {
++    if let Some(available) = dedicated_vram_gib {
++        return Some(
++            recipe
++                .min_gpu_mem_gb
++                .is_none_or(|required| available >= f64::from(required)),
++        );
++    }
++    let available = host_ram_gib?;
++    recipe
++        .recommended_system_ram_gb
++        .or(recipe.min_gpu_mem_gb)
++        .map(|required| available >= f64::from(required))
++}
++
++/// The per-row fit label, or `None` when the host's memory is unknown (a
++/// verdict on every row would then read "unknown", which is noise).
++fn model_recipe_host_fit_label(
++    recipe: &ModelRecipeRecord,
++    dedicated_vram_gib: Option<f64>,
++    host_ram_gib: Option<f64>,
++) -> Option<&'static str> {
++    if dedicated_vram_gib.is_some() {
++        return Some(model_recipe_gpu_fit_label(recipe, dedicated_vram_gib));
++    }
++    model_recipe_fits_host(recipe, None, host_ram_gib).map(|fits| {
++        if fits {
++            "fits this machine's memory"
++        } else {
++            "needs more memory than this machine has"
++        }
++    })
++}
++
+ fn model_recipe_memory_label(recipe: &ModelRecipeRecord) -> String {
+     recipe.min_gpu_mem_gb.map_or_else(
+         || "no GPU minimum".to_owned(),
+@@ -34747,10 +34867,15 @@ install therock";
+         assert!(!rendered.contains("DeepSeek-V4-Flash"));
+         // Without a known host GPU, no misleading per-row fit verdict is shown.
+         assert!(!rendered.contains("GPU fit unknown"));
+-        // Superseded / smoke / assistant recipes are hidden from the curated list.
++        // Superseded / smoke recipes are hidden from the curated list; the small
++        // default assistant is featured so small machines have something to run.
+         assert!(!rendered.contains("tiny-gpt2"));
+         assert!(!rendered.contains("Qwen/Qwen3.5-4B"));
+-        assert!(!rendered.contains("Qwen3-4B-Instruct-2507-GGUF"));
++        assert!(rendered.contains("Qwen3-4B-Instruct-2507-GGUF"));
++        // Host memory unknown: no summary line and no per-row verdicts.
++        assert!(!rendered.contains("This machine:"));
++        assert!(!rendered.contains("Fits this machine"));
++        assert!(!rendered.contains("memory than this machine has"));
+         // Disclaimer: the list is a starting point; any compatible HF model works.
+         assert!(rendered.contains("you can serve any compatible Hugging Face model"));
+         assert!(rendered.contains("rocm serve <owner/repo>:<quant>"));
+@@ -34771,6 +34896,53 @@ install therock";
+         assert!(!rendered.contains("GPU fit unknown"));
+     }
+ 
++    /// The "Fits this machine" block of a rendered model list.
++    fn fits_this_machine_block(rendered: &str) -> &str {
++        let start = rendered
++            .find("Fits this machine:")
++            .expect("fit section should be present");
++        let rest = &rendered[start..];
++        rest.split("\n\n").next().unwrap_or(rest)
++    }
++
++    #[test]
++    fn render_model_registry_text_offers_small_models_on_a_16_gib_host() {
++        // ROCMAI-548: a 16 GiB integrated-GPU host used to see only 17-62 GiB
++        // models. Without dedicated VRAM, system RAM is the budget.
++        let rendered = render_model_registry_text_with_context_and_host(None, None, Some(16.0));
++
++        assert!(rendered.contains("This machine: 16 GiB system memory"));
++        let fits = fits_this_machine_block(&rendered);
++        assert!(fits.contains("Qwen3-4B-Instruct-2507-GGUF"), "{fits}");
++        assert!(!fits.contains("Qwen3.6-27B"), "{fits}");
++        assert!(!fits.contains("gemma-4"), "{fits}");
++        // The larger models stay listed but are marked as too large.
++        assert!(rendered.contains("unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"));
++        assert!(rendered.contains("needs more memory than this machine has"));
++        assert!(rendered.contains("fits this machine's memory"));
++    }
++
++    #[test]
++    fn render_model_registry_text_says_when_nothing_fits() {
++        let rendered = render_model_registry_text_with_context_and_host(None, None, Some(2.0));
++
++        assert!(rendered.contains("No recommended model fits this machine's memory"));
++        assert!(!rendered.contains("Fits this machine:"));
++    }
++
++    #[test]
++    fn render_model_registry_text_prefers_dedicated_vram_over_system_ram() {
++        // A discrete card with 8 GiB VRAM does not fit a 22 GiB model even when the
++        // host has 64 GiB of RAM.
++        let rendered =
++            render_model_registry_text_with_context_and_host(None, Some(8.0), Some(64.0));
++
++        let fits = fits_this_machine_block(&rendered);
++        assert!(fits.contains("Qwen3-4B-Instruct-2507-GGUF"), "{fits}");
++        assert!(!fits.contains("Qwen3.6-35B-A3B"), "{fits}");
++        assert!(rendered.contains("needs a larger GPU"));
++    }
++
+     #[test]
+     fn model_catalog_header_only_names_source_for_configured_index() {
+         // Default built-in list: no implementation jargon, just the action.
+diff --git a/crates/rocm-core/src/lib.rs b/crates/rocm-core/src/lib.rs
+--- a/crates/rocm-core/src/lib.rs
++++ b/crates/rocm-core/src/lib.rs
+@@ -6513,11 +6513,24 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn featured_catalog_offers_a_model_for_16_gib_hosts() {
++        // ROCMAI-548: the curated list must not be only models too large for a
++        // small machine.
++        assert!(
++            builtin_model_recipes().iter().any(|recipe| {
++                model_recipe_featured(recipe)
++                    && recipe.recommended_system_ram_gb.is_some_and(|gib| gib <= 16)
++            }),
++            "no featured recipe fits a 16 GiB host"
++        );
++    }
++
+     #[test]
+     fn featured_catalog_is_curated_but_hidden_stay_resolvable() {
+         // Current popular models are featured in the curated list — GGUF for
+         // Strix Halo (served by their owner/repo:variant id) and BF16 for MI300X.
+-        for alias in ["qwen3.6", "gemma-4", "qwen3.6-27b", "gemma-4-31b"] {
++        for alias in ["qwen3.6", "gemma-4", "qwen3.6-27b", "gemma-4-31b", "qwen"] {
+             let recipe = resolve_builtin_model_recipe(alias).unwrap_or_else(|| panic!("{alias}"));
+             assert!(model_recipe_featured(&recipe), "{alias} should be featured");
+         }
+@@ -6531,7 +6544,7 @@ mod tests {
+         );
+         // ...while the default assistant, smoke paths, and superseded models stay
+         // resolvable for `rocm serve` but are hidden from the curated list.
+-        for alias in ["qwen", "tiny-gpt2", "qwen3.5", "glm-5"] {
++        for alias in ["qwen-smoke", "tiny-gpt2", "qwen3.5", "glm-5"] {
+             let recipe = resolve_builtin_model_recipe(alias).unwrap_or_else(|| panic!("{alias}"));
+             assert!(!model_recipe_featured(&recipe), "{alias} should be hidden");
+         }
+diff --git a/crates/rocm-core/src/model_catalog.json b/crates/rocm-core/src/model_catalog.json
+--- a/crates/rocm-core/src/model_catalog.json
++++ b/crates/rocm-core/src/model_catalog.json
+@@ -142,6 +142,7 @@
+         "qwen-tiny",
+         "llama-3.2-3b-instruct"
+       ],
++      "featured": true,
+       "chat_template_mode": "lemonade",
+       "preferred_engines": [
+         "lemonade"

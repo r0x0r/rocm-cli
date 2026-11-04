@@ -18,16 +18,19 @@
 //! whose daemon client never sends an instance snapshot (Windows — it
 //! connects and streams live GPU/CPU/memory every tick, but has no
 //! `rocmdashd` socket to source an instance list from, so
-//! `has_received_snapshot` never flips and `AppState::instances` stays empty
-//! for the life of the session). A live probe has neither problem — there is
-//! no window for it to go stale in.
+//! `has_received_snapshot` never flips). A live probe has neither problem —
+//! there is no window for it to go stale in. On Windows it is also the source
+//! of `AppState::instances` itself: `push_host_gpu_snapshot` replaces them
+//! with [`ManagedRegistrySnapshot::instances`] on every in-process tick.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use rocm_dash_core::metrics::Instance;
+
 /// Live classification of the managed-service registry, as of the moment
 /// [`ManagedRegistryProbe::snapshot`] was called.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct ManagedRegistrySnapshot {
     /// Whether any managed-service record is currently a live scrape target —
     /// the same statuses `Instance::status.is_serving()` treats as "actively
@@ -45,6 +48,11 @@ pub struct ManagedRegistrySnapshot {
     /// Docker- or Lemonade-discovered instance from an external daemon, which
     /// that command cannot stop.
     pub managed_ids: HashSet<String>,
+    /// The live scrape targets themselves (the records `managed_ids` names),
+    /// as dashboard instances with no telemetry. The Windows in-process ticker
+    /// has no daemon to send instances, so `AppState::push_host_gpu_snapshot`
+    /// takes them from here.
+    pub instances: Vec<Instance>,
 }
 
 /// rocm-core/rocm-dash-daemon-free live registry-read boundary.
@@ -63,10 +71,12 @@ pub struct ManagedRegistrySnapshot {
 /// daemon round-trip or network I/O. In the dashboard, [`snapshot`](Self::snapshot)
 /// is called every time something needs `live_registry_snapshot`'s answer:
 /// `request_quit` on the quit keystroke, `quit_confirm_request` on every
-/// render while the quit-confirm prompt is open, and
-/// `quit_confirm_open_services_key` on the `s` keystroke while it's open.
-/// The launcher's own `has_live_instance` check calls it on every render
-/// too, but through `StaticManagedRegistrySnapshot` — a read cached once per
+/// render while the quit-confirm prompt is open,
+/// `quit_confirm_open_services_key` on the `s` keystroke while it's open,
+/// and — on Windows only — `refresh_instances_from_registry` once at startup
+/// and once per in-process metrics tick (once a second). The launcher's own
+/// `has_live_instance` check
+/// calls it on every render too, but through `StaticManagedRegistrySnapshot` — a read cached once per
 /// menu pass — so that per-frame call never reaches an implementation's
 /// actual registry I/O; only the dashboard's calls above do.
 pub trait ManagedRegistryProbe: std::fmt::Debug + Send + Sync {
@@ -122,6 +132,7 @@ mod tests {
         let probe = StaticManagedRegistrySnapshot(ManagedRegistrySnapshot {
             has_live_service: true,
             managed_ids: ids.clone(),
+            ..Default::default()
         });
         let snap = probe.snapshot();
         assert!(snap.has_live_service);

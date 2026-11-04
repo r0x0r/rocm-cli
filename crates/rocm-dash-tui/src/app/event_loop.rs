@@ -243,6 +243,11 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     // Both `--demo` (a generated session replayed) and `--replay <file>` present
     // non-live data, so mark the session simulated for the honesty chrome.
     state.simulated = state.replay.is_some();
+    // Windows has no daemon to send instances: show the managed services now
+    // rather than "Nothing running" until the first in-process tick lands.
+    if cfg!(windows) && !state.simulated && !should_skip_daemon(args.focus) {
+        state.refresh_instances_from_registry();
+    }
 
     let mut chat = ChatRuntime::start(&mut state, args, &chat_tx).await;
 
@@ -978,6 +983,7 @@ mod tests {
             std::sync::Arc::new(StaticManagedRegistrySnapshot(ManagedRegistrySnapshot {
                 has_live_service: true,
                 managed_ids: std::iter::once("svc-a".to_string()).collect(),
+                ..Default::default()
             }));
         seed_registry_probe_and_hosting(&mut s, Some(probe.clone()), true);
 

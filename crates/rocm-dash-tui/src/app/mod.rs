@@ -596,15 +596,38 @@ impl AppState {
 
     /// Windows sibling of [`push_snapshot`](Self::push_snapshot) for
     /// `ClientMsg::HostGpuSnapshot`: applies host/GPU metrics for
-    /// charts/history exactly like a real snapshot, but deliberately leaves
-    /// `instances` and `has_received_snapshot` untouched. The Windows
-    /// in-process ticker (`client.rs`) always sends an empty `instances`
-    /// stand-in (no instance-registry daemon exists there yet), so treating
-    /// it as authoritative the way `push_snapshot` does would permanently
-    /// blind the issue #145 quit-confirm prompt to models actually being
-    /// served — see `has_live_instance_with`'s Windows note.
+    /// charts/history exactly like a real snapshot, but takes `instances`
+    /// from the live managed-service registry read instead of from the
+    /// snapshot. The Windows in-process ticker (`client.rs`) has no daemon to
+    /// discover instances, so the snapshot's own `instances` is always an
+    /// empty stand-in; the registry probe is the same source the Linux daemon
+    /// discovers managed services from. `has_received_snapshot` stays
+    /// untouched, so the issue #145 quit-confirm gate keeps reading the
+    /// registry live too — see `has_live_instance_with`'s Windows note.
+    ///
+    /// With no probe injected (a test building `AppState` directly),
+    /// `instances` is left as it was.
     pub(crate) fn push_host_gpu_snapshot(&mut self, snap: Snapshot) {
+        self.refresh_instances_from_registry();
         self.push_history_and_latest(snap);
+    }
+
+    /// Replace `instances` with the live managed services from the registry
+    /// probe (no-op without one). Windows-only in production: on each
+    /// in-process tick, and once at startup so the dashboard does not claim
+    /// "Nothing running" while the first GPU-counter query is still running.
+    /// Display order is not taken from here: every listing sorts
+    /// (`format::running_instances`, `sorted_instances`).
+    pub(crate) fn refresh_instances_from_registry(&mut self) {
+        if let Some(probe) = self.managed_registry_probe.as_ref() {
+            let live = probe.snapshot().instances;
+            self.instances.clear();
+            self.instances.extend(
+                live.into_iter()
+                    .map(|inst| (inst.container_id.clone(), inst)),
+            );
+            self.clamp_selectors();
+        }
     }
 
     /// Shared tail of [`push_snapshot`](Self::push_snapshot) and
@@ -679,12 +702,14 @@ mod tests {
     use super::test_support::{args_with_anthropic_key, st};
 
     #[test]
-    fn push_host_gpu_snapshot_leaves_instances_and_has_received_snapshot_untouched() {
+    fn push_host_gpu_snapshot_without_a_probe_leaves_instances_and_has_received_snapshot_untouched()
+    {
         // Mirrors push_snapshot's issue #145 authority handoff, but for the
         // Windows in-process path: a HostGpuSnapshot must still land
-        // host/GPU metrics for charts/history, while leaving `instances` and
-        // `has_received_snapshot` exactly as they were — see
-        // `push_host_gpu_snapshot`'s doc comment for why.
+        // host/GPU metrics for charts/history, never flip
+        // `has_received_snapshot`, and never trust the snapshot's own
+        // (always-empty-in-practice) `instances`. With no registry probe to
+        // read, `instances` stays exactly as it was.
         let mut s = st();
         s.instances.insert(
             "id0".to_string(),
@@ -721,6 +746,59 @@ mod tests {
             "host/GPU metrics must still land for charts/history"
         );
         assert_eq!(s.history.len(), 1);
+    }
+
+    /// Windows has no daemon to discover instances, so each in-process
+    /// HostGpuSnapshot tick must take them from the live registry read: a
+    /// served model appears on the next tick and drops off once the registry
+    /// stops reporting it.
+    #[test]
+    fn push_host_gpu_snapshot_takes_instances_from_the_live_registry_read() {
+        use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+
+        let served = Instance {
+            container_id: "lemonade-qwen".to_string(),
+            model_name: "Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M".to_string(),
+            status: InstanceStatus::Ready,
+            port: Some(11436),
+            ..Default::default()
+        };
+        let mut s = st();
+        s.managed_registry_probe = Some(std::sync::Arc::new(StaticManagedRegistrySnapshot(
+            ManagedRegistrySnapshot {
+                has_live_service: true,
+                managed_ids: std::iter::once(served.container_id.clone()).collect(),
+                instances: vec![served.clone()],
+            },
+        )));
+
+        s.push_host_gpu_snapshot(Snapshot::default());
+
+        assert_eq!(s.instances.len(), 1);
+        let inst = &s.instances["lemonade-qwen"];
+        assert_eq!(inst.model_name, served.model_name);
+        assert_eq!(inst.port, Some(11436));
+        assert!(
+            !s.has_received_snapshot,
+            "the registry read must not flip has_received_snapshot"
+        );
+        let snap = s.live_registry_snapshot();
+        assert!(s.has_live_instance_with(&snap));
+        assert!(
+            s.has_stoppable_managed_instance_with(&snap),
+            "a registry-sourced instance must be offered for stopping on quit"
+        );
+
+        s.managed_registry_probe = Some(std::sync::Arc::new(StaticManagedRegistrySnapshot(
+            ManagedRegistrySnapshot::default(),
+        )));
+        s.push_host_gpu_snapshot(Snapshot::default());
+
+        assert!(
+            s.instances.is_empty(),
+            "a service the registry no longer reports must drop off"
+        );
     }
 
     #[test]

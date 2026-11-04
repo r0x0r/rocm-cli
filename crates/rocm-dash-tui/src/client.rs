@@ -41,9 +41,8 @@ pub enum ClientMsg {
     /// Deliberately NOT `Event(Snapshot)` — that path treats `instances` as
     /// authoritative truth and latches `has_received_snapshot` forever, but
     /// this snapshot's `instances` is always an empty stand-in (Windows has
-    /// no instance registry daemon yet), so routing it through there would
-    /// permanently blind the issue #145 quit-confirm prompt to models
-    /// actually being served. See `AppState::push_host_gpu_snapshot`.
+    /// no instance registry daemon yet). `AppState::push_host_gpu_snapshot`
+    /// fills `instances` from the live managed-service registry read instead.
     HostGpuSnapshot(Box<Snapshot>),
     /// Replay-only: the scrubber jumped backward. The TUI must wipe any
     /// state derived from past events before the burst-emitted events for
@@ -230,9 +229,9 @@ fn build_host_gpu_snapshot(
 /// instead of connecting anywhere: `HostCollector` (already cross-platform)
 /// for CPU/memory, `WinPerfCollector` (OS perf counters, no AMD tool needed)
 /// for GPU. Sends `Connected` like the unix arm, but then a stream of
-/// `ClientMsg::HostGpuSnapshot` rather than `Event::Snapshot` — deliberately
-/// not routed through `Event::Snapshot`, to avoid disturbing the "quit while
-/// serving" confirmation prompt (see `AppState::push_host_gpu_snapshot`).
+/// `ClientMsg::HostGpuSnapshot` rather than `Event::Snapshot` — the app fills
+/// `instances` from the managed-service registry on each one (see
+/// `AppState::push_host_gpu_snapshot`).
 #[cfg(windows)]
 async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
     use rocm_dash_collectors::host::HostCollector;

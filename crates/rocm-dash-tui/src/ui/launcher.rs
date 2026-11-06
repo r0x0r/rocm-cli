@@ -325,6 +325,7 @@ fn launcher_state(theme_name: &str, serving: Vec<Instance>) -> AppState {
         ManagedRegistrySnapshot {
             has_live_service,
             managed_ids,
+            instances: serving.clone(),
         },
     )));
     state.instances = serving
@@ -892,6 +893,7 @@ mod tests {
             ManagedRegistrySnapshot {
                 has_live_service: true,
                 managed_ids: std::collections::HashSet::from(["vllm-1".to_string()]),
+                ..Default::default()
             },
         )));
         s.open_quit_confirm();
